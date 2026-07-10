@@ -29,6 +29,8 @@ pub enum Topic {
     BlinkCursor,
     BlinkTimeout,
     Frame,
+    /// Auto-hide Learnminal overlay after a transient error (Req 11).
+    LearnminalErrorDismiss,
 }
 
 /// Event scheduled to be emitted at a specific time.

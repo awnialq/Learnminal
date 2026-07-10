@@ -12,6 +12,7 @@ use alacritty_terminal::term::TermMode;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 use crate::config::{Action, BindingKey, BindingMode, KeyBinding};
+use crate::learnminal::OverlayAction;
 use crate::display::window::ImeInhibitor;
 use crate::event::TYPING_SEARCH_DELAY;
 use crate::input::{ActionContext, Execute, Processor};
@@ -25,8 +26,30 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             return;
         }
 
-        let mode = *self.ctx.terminal().mode();
         let mods = self.ctx.modifiers().state();
+
+        if self.ctx.display().learnminal_overlay.is_visible()
+            && self.ctx.display().learnminal_overlay.input_focus()
+                == crate::learnminal::InputFocus::Overlay
+        {
+            match self.ctx.display().learnminal_overlay.handle_key(&key, mods) {
+                OverlayAction::CopySelection(text) => {
+                    self.ctx.clipboard_mut().store(
+                        alacritty_terminal::term::ClipboardType::Clipboard,
+                        text,
+                    );
+                },
+                OverlayAction::Close => self.ctx.cancel_learnminal_error_dismiss(),
+                OverlayAction::SubmitChat(query) => self.ctx.trigger_chat(query),
+                OverlayAction::ToggleMode => {},
+                OverlayAction::RunSlashCommand(cmd) => self.ctx.trigger_slash_command(cmd),
+                OverlayAction::ScrollUp | OverlayAction::ScrollDown | OverlayAction::None => {},
+            }
+            self.ctx.mark_dirty();
+            return;
+        }
+
+        let mode = *self.ctx.terminal().mode();
 
         if key.state == ElementState::Released {
             if self.ctx.inline_search_state().char_pending {

@@ -1,1 +1,31 @@
-target
+# Rust / Cargo
+target/
+/target/
+
+# Python (ai-backend)
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Local logs and data (runtime)
+.ai-cli-learning/
+
+# Planning docs (local only)
+planning/

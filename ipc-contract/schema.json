@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learnminal IPC Contract",
+  "description": "Integration boundary between Alacritty (Rust) and the AI backend (Python).",
+  "definitions": {
+    "TerminalContext": {
+      "type": "object",
+      "required": [
+        "visible_text",
+        "selected_text",
+        "last_command",
+        "cwd",
+        "exit_code",
+        "rows",
+        "cols"
+      ],
+      "properties": {
+        "visible_text": {
+          "type": "string",
+          "maxLength": 8000,
+          "description": "UTF-8 truncated grid content (prefix + suffix when middle-truncated)."
+        },
+        "selected_text": {
+          "type": ["string", "null"],
+          "description": "Highlighted text when a selection is active; null otherwise."
+        },
+        "last_command": {
+          "type": "string",
+          "description": "Text after the last prompt character in the last 10 lines; empty if not detectable."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Current working directory of the shell."
+        },
+        "exit_code": {
+          "type": ["integer", "null"],
+          "description": "Exit code of the last command; null when unknown."
+        },
+        "rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExplainRequest": {
+      "type": "object",
+      "required": ["request_id", "timestamp", "terminal"],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "UUID v4 string."
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Unix epoch seconds."
+        },
+        "terminal": {
+          "$ref": "#/definitions/TerminalContext"
+        },
+        "follow_up_question": {
+          "type": ["string", "null"],
+          "description": "Optional follow-up question from the overlay input field; omitted on first explain."
+        }
+      },
+      "additionalProperties": false
+    },
+    "FlagExplanation": {
+      "type": "object",
+      "required": ["flag", "meaning", "example"],
+      "properties": {
+        "flag": { "type": "string" },
+        "meaning": { "type": "string" },
+        "example": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "ExplainResponse": {
+      "type": "object",
+      "required": [
+        "command_name",
+        "flags_explained",
+        "general_utility",
+        "contextual_usage",
+        "error_fix",
+        "similar_commands",
+        "tool_calls_made"
+      ],
+      "properties": {
+        "command_name": { "type": "string" },
+        "flags_explained": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/FlagExplanation" }
+        },
+        "general_utility": { "type": "string" },
+        "contextual_usage": { "type": "string" },
+        "error_fix": { "type": ["string", "null"] },
+        "similar_commands": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "tool_calls_made": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "actionable_items": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 5,
+          "description": "Shell-ready commands the user can run verbatim (max 5)."
+        }
+      },
+      "additionalProperties": false
+    },
+    "SseChunkEvent": {
+      "type": "object",
+      "required": ["text", "chunk_index"],
+      "properties": {
+        "text": { "type": "string" },
+        "chunk_index": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "SseStructuredDoneEvent": {
+      "type": "object",
+      "required": ["structured", "done"],
+      "properties": {
+        "structured": { "$ref": "#/definitions/ExplainResponse" },
+        "done": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "SseErrorEvent": {
+      "type": "object",
+      "required": ["error", "done"],
+      "properties": {
+        "error": { "type": "string" },
+        "done": { "const": true }
+      },
+      "additionalProperties": false
+    }
+  },
+  "endpoints": {
+    "POST /explain": {
+      "request": { "$ref": "#/definitions/ExplainRequest" },
+      "response": {
+        "contentType": "text/event-stream",
+        "events": [
+          { "description": "Incremental text chunk", "data": { "$ref": "#/definitions/SseChunkEvent" } },
+          {
+            "description": "Final structured response",
+            "data": { "$ref": "#/definitions/SseStructuredDoneEvent" }
+          },
+          { "description": "Stream terminator", "data": "[DONE]" },
+          { "description": "Error", "data": { "$ref": "#/definitions/SseErrorEvent" } }
+        ]
+      }
+    },
+    "GET /health": {
+      "response": {
+        "type": "object",
+        "required": ["status", "model"],
+        "properties": {
+          "status": { "const": "ok" },
+          "model": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "POST /command-reference": {
+      "request": {
+        "type": "object",
+        "required": ["program"],
+        "properties": { "program": { "type": "string", "minLength": 1 } }
+      },
+      "response": {
+        "type": "object",
+        "required": ["program", "source", "title", "sections"],
+        "properties": {
+          "program": { "type": "string" },
+          "source": { "type": "string" },
+          "title": { "type": "string" },
+          "sections": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "lines"],
+              "properties": {
+                "name": { "type": "string" },
+                "lines": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /chat": {
+      "request": {
+        "type": "object",
+        "required": ["request_id", "timestamp", "terminal", "message"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "timestamp": { "type": "integer" },
+          "terminal": { "$ref": "#/definitions/TerminalContext" },
+          "message": { "type": "string", "minLength": 1 }
+        }
+      },
+      "response": {
+        "contentType": "text/event-stream",
+        "events": [
+          { "description": "Incremental text chunk", "data": { "$ref": "#/definitions/SseChunkEvent" } },
+          {
+            "description": "Chat reply complete",
+            "data": {
+              "type": "object",
+              "required": ["reply", "done"],
+              "properties": {
+                "reply": { "type": "string" },
+                "actionable_items": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "maxItems": 5
+                },
+                "done": { "const": true }
+              }
+            }
+          },
+          { "description": "Stream terminator", "data": "[DONE]" },
+          { "description": "Error", "data": { "$ref": "#/definitions/SseErrorEvent" } }
+        ]
+      }
+    }
+  }
+}

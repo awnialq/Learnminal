@@ -51,6 +51,7 @@ use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
+use crate::learnminal::OverlayPanel;
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
 use crate::renderer::{self, GlyphCache, Renderer, platform};
@@ -397,6 +398,9 @@ pub struct Display {
 
     glyph_cache: GlyphCache,
     meter: Meter,
+
+    /// Learnminal AI explanation overlay.
+    pub learnminal_overlay: OverlayPanel,
 }
 
 impl Display {
@@ -539,7 +543,37 @@ impl Display {
             cursor_hidden: Default::default(),
             meter: Default::default(),
             ime: Default::default(),
+            learnminal_overlay: OverlayPanel::new(),
         })
+    }
+
+    fn draw_learnminal_overlay(&mut self, config: &UiConfig) {
+        if !self.learnminal_overlay.is_visible() {
+            return;
+        }
+
+        // Always paint the overlay when visible. Skipping draws during the 16ms batch
+        // window left the panel blank after loading text was removed.
+        self.learnminal_overlay.flush_pending();
+        self.damage_tracker.frame().mark_fully_damaged();
+
+        let draw = self.learnminal_overlay.prepare_draw(&self.size_info, config);
+        let metrics = self.glyph_cache.font_metrics();
+        if !draw.rects.is_empty() {
+            self.renderer.draw_rects(&self.size_info, &metrics, draw.rects);
+        }
+        for overlay_text in draw.texts {
+            self.renderer.draw_string(
+                overlay_text.point,
+                overlay_text.fg,
+                overlay_text.bg,
+                overlay_text.text.chars(),
+                &self.size_info,
+                &mut self.glyph_cache,
+            );
+        }
+
+        self.learnminal_overlay.clear_needs_redraw();
     }
 
     #[inline]
@@ -732,6 +766,10 @@ impl Display {
 
             // Clear focused search match.
             search_state.clear_focused_match();
+
+            if self.learnminal_overlay.is_visible() {
+                self.learnminal_overlay.on_window_resize();
+            }
         }
         self.size_info = new_size;
     }
@@ -1007,6 +1045,8 @@ impl Display {
             // Draw rectangles.
             self.renderer.draw_rects(&size_info, &metrics, rects);
         }
+
+        self.draw_learnminal_overlay(config);
 
         self.draw_render_timer(config);
 

@@ -1,4 +1,4 @@
-TARGET = alacritty
+TARGET = learnminal
 
 ASSETS_DIR = extra
 RELEASE_DIR = target/release
@@ -13,7 +13,7 @@ COMPLETIONS = $(COMPLETIONS_DIR)/_alacritty \
 	$(COMPLETIONS_DIR)/alacritty.bash \
 	$(COMPLETIONS_DIR)/alacritty.fish
 
-APP_NAME = Alacritty.app
+APP_NAME = Learnminal.app
 APP_TEMPLATE = $(ASSETS_DIR)/osx/$(APP_NAME)
 APP_DIR = $(RELEASE_DIR)/osx
 APP_BINARY = $(RELEASE_DIR)/$(TARGET)
@@ -21,7 +21,7 @@ APP_BINARY_DIR = $(APP_DIR)/$(APP_NAME)/Contents/MacOS
 APP_EXTRAS_DIR = $(APP_DIR)/$(APP_NAME)/Contents/Resources
 APP_COMPLETIONS_DIR = $(APP_EXTRAS_DIR)/completions
 
-DMG_NAME = Alacritty.dmg
+DMG_NAME = Learnminal.dmg
 DMG_DIR = $(RELEASE_DIR)/osx
 
 vpath $(TARGET) $(RELEASE_DIR)
@@ -42,8 +42,8 @@ $(TARGET)-universal:
 	MACOSX_DEPLOYMENT_TARGET="10.12" cargo build --release --target=aarch64-apple-darwin
 	@lipo target/{x86_64,aarch64}-apple-darwin/release/$(TARGET) -create -output $(APP_BINARY)
 
-app: $(APP_NAME)-native ## Create an Alacritty.app
-app-universal: $(APP_NAME)-universal ## Create a universal Alacritty.app
+app: $(APP_NAME)-native ## Create Learnminal.app
+app-universal: $(APP_NAME)-universal ## Create a universal Learnminal.app
 $(APP_NAME)-%: $(TARGET)-%
 	@mkdir -p $(APP_BINARY_DIR)
 	@mkdir -p $(APP_EXTRAS_DIR)
@@ -62,13 +62,13 @@ $(APP_NAME)-%: $(TARGET)-%
 	@codesign --force --deep --sign - "$(APP_DIR)/$(APP_NAME)"
 	@echo "Created '$(APP_NAME)' in '$(APP_DIR)'"
 
-dmg: $(DMG_NAME)-native ## Create an Alacritty.dmg
-dmg-universal: $(DMG_NAME)-universal ## Create a universal Alacritty.dmg
+dmg: $(DMG_NAME)-native ## Create Learnminal.dmg
+dmg-universal: $(DMG_NAME)-universal ## Create a universal Learnminal.dmg
 $(DMG_NAME)-%: $(APP_NAME)-%
 	@echo "Packing disk image..."
 	@ln -sf /Applications $(DMG_DIR)/Applications
 	@hdiutil create $(DMG_DIR)/$(DMG_NAME) \
-		-volname "Alacritty" \
+		-volname "Learnminal" \
 		-fs HFS+ \
 		-srcfolder $(APP_DIR) \
 		-ov -format UDZO

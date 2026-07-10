@@ -247,6 +247,14 @@ pub enum Action {
     /// Start a backward buffer search.
     SearchBackward,
 
+    /// Request an AI explanation overlay (Learnminal).
+    #[config(skip)]
+    Explain,
+
+    /// Toggle keyboard focus between terminal and Learnminal overlay.
+    #[config(skip)]
+    ToggleLearnminalFocus,
+
     /// No action.
     None,
 }
@@ -431,6 +439,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
     let mut bindings = bindings!(
         KeyBinding;
         Copy; Action::Copy;
+        "e", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::Explain;
+        Tab, ModifiersState::CONTROL | ModifiersState::SHIFT; Action::ToggleLearnminalFocus;
         Copy,  +BindingMode::VI; Action::ClearSelection;
         Paste, ~BindingMode::VI; Action::Paste;
         Paste, +BindingMode::VI, +BindingMode::SEARCH; Action::Paste;

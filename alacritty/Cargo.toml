@@ -1,6 +1,8 @@
 [package]
 name = "alacritty"
 version = "0.18.0-dev"
+autobins = false
+default-run = "learnminal"
 authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
 license = "Apache-2.0"
 description = "A fast, cross-platform, OpenGL terminal emulator"
@@ -37,6 +39,8 @@ parking_lot = "0.12.0"
 polling = "3.11.0"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json"] }
+uuid = { version = "1", features = ["v4"] }
 serde_yaml = "0.9.25"
 signal-hook = { version = "0.4.3", default-features = false }
 tempfile = "3.12.0"
@@ -50,6 +54,8 @@ gl_generator = "0.14.0"
 
 [dev-dependencies]
 clap_complete = "4.2.3"
+mockito = "1"
+proptest = "1"
 
 [target.'cfg(not(windows))'.dependencies]
 xdg = "3.0.0"
@@ -102,3 +108,7 @@ wayland = [
     "winit/wayland-csd-adwaita-crossfont",
 ]
 nightly = []
+
+[[bin]]
+name = "learnminal"
+path = "src/main.rs"

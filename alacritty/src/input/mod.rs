@@ -144,6 +144,18 @@ pub trait ActionContext<T: EventListener> {
         S: AsRef<OsStr>,
     {
     }
+
+    fn trigger_explain(&mut self) {}
+
+    fn toggle_learnminal_focus(&mut self) {}
+
+    fn trigger_chat(&mut self, _query: String) {}
+
+    fn trigger_slash_command(&mut self, _command: crate::learnminal::SlashCommand) {}
+
+    fn schedule_learnminal_error_dismiss(&mut self) {}
+
+    fn cancel_learnminal_error_dismiss(&mut self) {}
 }
 
 impl Action {
@@ -320,6 +332,8 @@ impl<T: EventListener> Execute<T> for Action {
             Action::Mouse(MouseAction::ExpandSelection) => ctx.expand_selection(),
             Action::SearchForward => ctx.start_search(Direction::Right),
             Action::SearchBackward => ctx.start_search(Direction::Left),
+            Action::Explain => ctx.trigger_explain(),
+            Action::ToggleLearnminalFocus => ctx.toggle_learnminal_focus(),
             Action::Copy => ctx.copy_selection(ClipboardType::Clipboard),
             #[cfg(not(any(target_os = "macos", windows)))]
             Action::CopySelection => ctx.copy_selection(ClipboardType::Selection),
@@ -615,6 +629,19 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn on_mouse_press(&mut self, button: MouseButton) {
+        if self.ctx.display().learnminal_overlay.is_visible() {
+            let x = self.ctx.mouse().x as f32;
+            let y = self.ctx.mouse().y as f32;
+            let size = self.ctx.size_info();
+            let focus = if self.ctx.display().learnminal_overlay.contains_panel_point(x, y, &size) {
+                crate::learnminal::InputFocus::Overlay
+            } else {
+                crate::learnminal::InputFocus::Terminal
+            };
+            self.ctx.display().learnminal_overlay.set_input_focus(focus);
+            self.ctx.mark_dirty();
+        }
+
         // Handle mouse mode.
         if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
             self.ctx.mouse_mut().click_state = ClickState::None;

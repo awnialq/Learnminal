@@ -17,9 +17,14 @@ use crate::config::ui_config::Program;
 use crate::config::window::{Class, Identity};
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 
-/// CLI options for the main Alacritty executable.
+/// CLI options for the Learnminal executable.
 #[derive(Parser, Default, Debug)]
-#[clap(author, about, version = env!("VERSION"))]
+#[clap(
+    name = "learnminal",
+    author,
+    about = "Learnminal — terminal with AI-powered explanations",
+    version = env!("VERSION"),
+)]
 pub struct Options {
     /// Print all events to STDOUT.
     #[clap(long)]
