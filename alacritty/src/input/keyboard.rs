@@ -39,7 +39,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                         text,
                     );
                 },
-                OverlayAction::Close => self.ctx.cancel_learnminal_error_dismiss(),
+                OverlayAction::Close => {
+                    self.ctx.cancel_learnminal_error_dismiss();
+                    self.ctx.cancel_learnminal_inflight();
+                },
                 OverlayAction::SubmitChat(query) => self.ctx.trigger_chat(query),
                 OverlayAction::ToggleMode => {},
                 OverlayAction::RunSlashCommand(cmd) => self.ctx.trigger_slash_command(cmd),

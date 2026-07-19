@@ -1,8 +1,8 @@
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthChar;
 
-use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Point};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -10,10 +10,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::config::UiConfig;
 use crate::display::color::Rgb;
 use crate::display::SizeInfo;
-use crate::learnminal::types::{
-    parse_explain_response_lenient, strip_json_fences, CommandReferenceResponse, ExplainResponse,
-    FlagExplanation, SystemInfo,
-};
+use crate::learnminal::types::SystemInfo;
 use crate::renderer::rects::RenderRect;
 
 const BATCH_INTERVAL: Duration = Duration::from_millis(16);
@@ -23,19 +20,13 @@ const SCROLL_REPEAT_MAX_LINES: usize = 12;
 const PANEL_WIDTH_FRACTION: f32 = 0.42;
 const PANEL_HEIGHT_FRACTION: f32 = 0.45;
 const PANEL_ALPHA: f32 = 0.96;
-const HUD_ALPHA: f32 = 0.92;
-/// Max display columns for the top-right actionable HUD.
-const HUD_MAX_COLS: usize = 52;
-/// Max actionable lines shown in the HUD (title + items).
-const HUD_MAX_ITEMS: usize = 5;
 const ACCENT_WIDTH_PX: f32 = 4.0;
 const HEADER_ROWS: usize = 2;
 const FOOTER_ROWS: usize = 3;
 const INPUT_MAX_LEN: usize = 256;
 const BORDER_ALPHA: f32 = 0.85;
 
-const MSG_BACKEND_NOT_RUNNING: &str =
-    "AI backend not running. Start with: uv sync && uv run --directory ai-backend python server.py";
+const MSG_BACKEND_NOT_RUNNING: &str = "Ollama not running. Start with: ollama serve";
 const MSG_TIMEOUT: &str =
     "Response timed out. The model may be overloaded. Try a shorter selection.";
 const MSG_EMPTY_CONTEXT: &str = "Could not read terminal content. Try selecting text manually.";
@@ -47,6 +38,10 @@ pub const ERROR_AUTO_DISMISS_SECS: u64 = 8;
 pub enum SlashCommand {
     /// Show OS, package managers, and detected installed tools.
     Info { refresh: bool },
+    /// List or switch the active Ollama model.
+    Model { name: Option<String>, list: bool },
+    /// Browse or clear the local command journal.
+    Journal { program: Option<String>, clear: bool },
     /// List available slash commands (handled locally).
     Help,
     /// Clear the Chat mode transcript (handled locally).
@@ -70,6 +65,25 @@ impl SlashCommand {
             "info" => {
                 let refresh = words.any(|w| w.eq_ignore_ascii_case("refresh"));
                 Some(Ok(Self::Info { refresh }))
+            },
+            "model" => {
+                let list = words.any(|w| w.eq_ignore_ascii_case("list"));
+                let name = words.find(|w| !w.eq_ignore_ascii_case("list")).map(str::to_owned);
+                Some(Ok(Self::Model { name, list }))
+            },
+            "journal" => {
+                let mut args: Vec<&str> = words.collect();
+                let clear = args.first().is_some_and(|w| w.eq_ignore_ascii_case("clear"));
+                if clear {
+                    args.remove(0);
+                }
+                let program = args.first().map(|s| (*s).to_owned());
+                if clear && program.is_none() {
+                    return Some(Err(
+                        "Usage: /journal clear <program>".into(),
+                    ));
+                }
+                Some(Ok(Self::Journal { program, clear }))
             },
             "help" => Some(Ok(Self::Help)),
             "clear" => Some(Ok(Self::Clear)),
@@ -163,16 +177,14 @@ pub struct OverlayPanel {
     input_buffer: String,
     input_focus: InputFocus,
     input_focused: bool,
-    /// Shell-ready commands for the top-right HUD.
-    actionable_items: Vec<String>,
     context_selection: Option<String>,
     context_command: String,
     pending_redraw: bool,
     last_append: Option<Instant>,
     has_chunks: bool,
     needs_redraw: bool,
-    /// Raw tokens from SSE chunks (JSON from Ollama); not shown until `finalize`.
-    stream_buffer: String,
+    /// Monotonic request generation — stale responses are ignored.
+    request_generation: Cell<u64>,
     /// True while streaming a chat answer.
     chat_active: bool,
     /// Index in `chat_lines` of the in-progress assistant reply (for live token append).
@@ -203,14 +215,13 @@ impl OverlayPanel {
             input_buffer: String::new(),
             input_focus: InputFocus::Overlay,
             input_focused: true,
-            actionable_items: Vec::new(),
             context_selection: None,
             context_command: String::new(),
             pending_redraw: false,
             last_append: None,
             has_chunks: false,
             needs_redraw: false,
-            stream_buffer: String::new(),
+            request_generation: Cell::new(0),
             chat_active: false,
             chat_stream_line: None,
             lines_before_error: None,
@@ -301,9 +312,7 @@ impl OverlayPanel {
         self.input_buffer.clear();
         self.input_focus = InputFocus::Overlay;
         self.input_focused = true;
-        self.actionable_items.clear();
         self.has_chunks = false;
-        self.stream_buffer.clear();
         self.chat_active = false;
         self.chat_stream_line = None;
         self.lines_before_error = None;
@@ -313,14 +322,18 @@ impl OverlayPanel {
         self.needs_redraw = true;
     }
 
+    /// Open the overlay directly in Chat mode (Ctrl+Shift+E entry point).
+    pub fn show_chat(&mut self) {
+        self.show();
+        self.interaction_mode = InteractionMode::Chat;
+    }
+
     pub fn hide(&mut self) {
         self.visible = false;
         self.mode = OverlayMode::Normal;
         self.command_lines.clear();
         self.chat_lines.clear();
-        self.stream_buffer.clear();
         self.input_buffer.clear();
-        self.actionable_items.clear();
         self.lines_before_error = None;
         self.error_only = false;
         self.needs_redraw = true;
@@ -349,29 +362,27 @@ impl OverlayPanel {
         self.mode == OverlayMode::Error
     }
 
+    pub fn bump_request_generation(&self) -> u64 {
+        let next = self.request_generation.get().wrapping_add(1);
+        self.request_generation.set(next);
+        next
+    }
+
+    pub fn is_stale_request(&self, generation: u64) -> bool {
+        generation != self.request_generation.get()
+    }
+
+    pub fn request_generation(&self) -> u64 {
+        self.request_generation.get()
+    }
+
     pub fn set_loading(&mut self) {
-        let label = match self.interaction_mode {
-            InteractionMode::Command => "  ◐  Loading command reference…",
-            InteractionMode::Chat => "  ◐  Loading answer…",
-        };
         *self.view_lines_mut() = vec![
             DisplayLine { text: String::new(), style: LineStyle::Body },
-            DisplayLine { text: label.into(), style: LineStyle::Muted },
+            DisplayLine { text: "  ◐  Loading…".into(), style: LineStyle::Muted },
             DisplayLine { text: String::new(), style: LineStyle::Body },
         ];
         self.needs_redraw = true;
-    }
-
-    pub fn append_chunk(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.has_chunks = true;
-        // Accumulate tokens only; the backend streams JSON from Ollama. Showing chunks
-        // directly would flash raw JSON in the panel. Keep the loading state until finalize.
-        self.stream_buffer.push_str(text);
-        self.pending_redraw = true;
-        self.last_append = Some(Instant::now());
     }
 
     pub fn flush_pending(&mut self) {
@@ -382,47 +393,13 @@ impl OverlayPanel {
     }
 
     pub fn should_batch(&self) -> bool {
-        self.pending_redraw
-            && self.last_append.is_some_and(|t| t.elapsed() < BATCH_INTERVAL)
+        self.pending_redraw && self.last_append.is_some_and(|t| t.elapsed() < BATCH_INTERVAL)
     }
 
-    /// If the backend streamed JSON tokens but the structured `done` event was not parsed,
-    /// try to build the formatted view from the accumulated stream buffer.
-    pub fn try_finalize_from_stream_buffer(&mut self) -> bool {
-        if self.stream_buffer.is_empty() {
-            return false;
-        }
-        let json_text = strip_json_fences(&self.stream_buffer);
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_text) else {
-            return false;
-        };
-        let Some(response) = parse_explain_response_lenient(&value) else {
-            return false;
-        };
-        self.finalize(&response);
-        true
-    }
-
-    pub fn finalize(&mut self, response: &ExplainResponse) {
-        self.remove_loading_lines();
-        self.stream_buffer.clear();
-
-        let structured = format_structured_response(response);
-        self.command_lines = structured;
-        self.actionable_items = actionable_items_from_response(response);
-        self.has_chunks = true;
-        self.stick_to_bottom = true;
-        self.scroll_burst = 0;
-        self.pending_redraw = false;
-        self.last_append = None;
-        self.needs_redraw = true;
-    }
-
-    /// Show a loading state while a slash command fetches from the backend.
+    /// Show a loading state while a slash command fetches from Ollama.
     pub fn begin_slash_command(&mut self, label: &str) {
         self.chat_active = false;
         self.has_chunks = false;
-        self.stream_buffer.clear();
         self.pending_redraw = false;
         self.last_append = None;
         self.input_buffer.clear();
@@ -430,66 +407,17 @@ impl OverlayPanel {
         self.scroll_burst = 0;
         let lines = self.view_lines_mut();
         lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-        lines.push(DisplayLine {
-            text: format!("Running {label}…"),
-            style: LineStyle::Muted,
-        });
+        lines.push(DisplayLine { text: format!("Running {label}…"), style: LineStyle::Muted });
         self.push_loading_lines();
         self.needs_redraw = true;
     }
 
-    /// Show formatted man/--help reference (Command mode).
-    pub fn show_command_reference(&mut self, response: &CommandReferenceResponse) {
-        self.remove_loading_lines();
-        self.interaction_mode = InteractionMode::Command;
-        self.has_chunks = true;
-        self.stick_to_bottom = true;
-        self.scroll_burst = 0;
-        self.stream_buffer.clear();
-
-        let mut lines = Vec::new();
-        lines.push(DisplayLine {
-            text: format!("── {} ", response.title) + &"─".repeat(12),
-            style: LineStyle::SectionHeader,
-        });
-        if response.source != "none" {
-            lines.push(DisplayLine {
-                text: format!("  (from {})", response.source),
-                style: LineStyle::Muted,
-            });
-        }
-        lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-
-        for section in &response.sections {
-            lines.push(DisplayLine {
-                text: section.name.clone(),
-                style: LineStyle::SectionHeader,
-            });
-            for line in &section.lines {
-                if line.is_empty() {
-                    lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-                } else {
-                    lines.push(DisplayLine {
-                        text: format!("  {line}"),
-                        style: LineStyle::Body,
-                    });
-                }
-            }
-            lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-        }
-
-        self.command_lines = lines;
-        self.actionable_items = actionable_items_from_command_reference(response);
-        self.needs_redraw = true;
-    }
-
-    /// Clear Chat mode content; leaves Command mode explanation unchanged.
+    /// Clear Chat mode content.
     pub fn clear_chat_output(&mut self) {
         self.chat_lines.clear();
         self.chat_active = false;
         self.chat_stream_line = None;
         self.lines_before_error = None;
-        self.stream_buffer.clear();
         self.pending_redraw = false;
         self.last_append = None;
         self.scroll_offset = 0;
@@ -505,17 +433,14 @@ impl OverlayPanel {
         self.chat_active = true;
         self.chat_stream_line = None;
         self.has_chunks = false;
-        self.stream_buffer.clear();
         self.pending_redraw = false;
         self.last_append = None;
         self.input_buffer.clear();
         self.stick_to_bottom = true;
         self.scroll_burst = 0;
         self.chat_lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-        self.chat_lines.push(DisplayLine {
-            text: format!("You: {query}"),
-            style: LineStyle::SectionHeader,
-        });
+        self.chat_lines
+            .push(DisplayLine { text: format!("You: {query}"), style: LineStyle::SectionHeader });
         self.push_loading_lines();
         self.needs_redraw = true;
     }
@@ -533,10 +458,8 @@ impl OverlayPanel {
                 line.text.push_str(text);
             }
         } else {
-            self.chat_lines.push(DisplayLine {
-                text: format!("Learnminal: {text}"),
-                style: LineStyle::Body,
-            });
+            self.chat_lines
+                .push(DisplayLine { text: format!("Learnminal: {text}"), style: LineStyle::Body });
             self.chat_stream_line = Some(self.chat_lines.len() - 1);
         }
 
@@ -544,25 +467,16 @@ impl OverlayPanel {
         self.needs_redraw = true;
     }
 
-    pub fn finalize_chat(&mut self, reply: &str, actionable_items: &[String]) {
+    pub fn finalize_chat(&mut self, reply: &str) {
         self.remove_loading_lines();
         self.chat_active = false;
         if let Some(idx) = self.chat_stream_line.take() {
-            if let Some(line) = self.chat_lines.get_mut(idx) {
-                line.text = format!("Learnminal: {reply}");
-            }
-        } else {
-            self.chat_lines.push(DisplayLine {
-                text: format!("Learnminal: {reply}"),
-                style: LineStyle::Body,
-            });
+            self.chat_lines.truncate(idx);
         }
+        self.chat_lines
+            .push(DisplayLine { text: "Learnminal:".into(), style: LineStyle::SectionHeader });
+        self.chat_lines.extend(format_prose_with_section_headers(reply));
         self.chat_lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-        if actionable_items.is_empty() {
-            self.actionable_items = extract_actionable_from_prose(Some(reply));
-        } else {
-            self.actionable_items = actionable_items.iter().take(HUD_MAX_ITEMS).cloned().collect();
-        }
         self.has_chunks = true;
         self.stick_to_bottom = true;
         self.needs_redraw = true;
@@ -582,10 +496,7 @@ impl OverlayPanel {
     fn push_loading_lines(&mut self) {
         let lines = self.view_lines_mut();
         lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-        lines.push(DisplayLine {
-            text: "  ◐  Loading…".into(),
-            style: LineStyle::Muted,
-        });
+        lines.push(DisplayLine { text: "  ◐  Loading…".into(), style: LineStyle::Muted });
         lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
     }
 
@@ -617,12 +528,18 @@ impl OverlayPanel {
         self.show_slash_message(
             "Slash commands",
             &[
-                "/info — OS, shell, package managers, installed packages, tools".into(),
-                "/info refresh — re-scan system and refresh package inventory".into(),
+                "/info — OS, shell, package managers, installed tools".into(),
+                "/info refresh — re-scan system environment".into(),
+                "/model list — show installed Ollama models".into(),
+                "/model <name> — switch active model".into(),
+                "/journal — list programs with saved notes".into(),
+                "/journal <program> — show recent notes for a program".into(),
+                "/journal clear <program> — delete notes for a program".into(),
                 "/clear — clear the Chat transcript".into(),
                 "/help — show this list".into(),
                 "".into(),
-                "Tab → Chat mode to ask the agent about your command.".into(),
+                "Ctrl+Shift+E → open Chat.".into(),
+                "Tab → toggle Chat / Command focus.".into(),
             ],
         );
     }
@@ -642,9 +559,9 @@ impl OverlayPanel {
         if info.installed_packages.is_empty() {
             lines.push("Installed packages: none enumerated (run /info refresh)".into());
         } else {
-            let total = info.installed_packages_total.unwrap_or_else(|| {
-                info.installed_packages.values().map(|v| v.len() as u64).sum()
-            });
+            let total = info
+                .installed_packages_total
+                .unwrap_or_else(|| info.installed_packages.values().map(|v| v.len() as u64).sum());
             lines.push(format!("Installed packages: {total} total across managers"));
             let mut managers: Vec<_> = info.installed_packages.keys().collect();
             managers.sort();
@@ -652,7 +569,8 @@ impl OverlayPanel {
                 if let Some(pkgs) = info.installed_packages.get(mgr) {
                     let sample: Vec<_> = pkgs.iter().take(8).cloned().collect();
                     let more = pkgs.len().saturating_sub(sample.len());
-                    let suffix = if more > 0 { format!(" … +{more} more") } else { String::new() };
+                    let suffix =
+                        if more > 0 { format!(" … +{more} more") } else { String::new() };
                     lines.push(format!("  {mgr} ({}): {}{suffix}", pkgs.len(), sample.join(", ")));
                 }
             }
@@ -674,7 +592,35 @@ impl OverlayPanel {
         self.show_slash_message("System environment (known to the agent)", &lines);
     }
 
-    fn show_slash_message(&mut self, title: &str, body_lines: &[String]) {
+    /// Display installed Ollama models and the active model.
+    pub fn show_models(&mut self, models: &[String], current: &str) {
+        let mut lines = vec![format!("Active model: {current}")];
+        if models.is_empty() {
+            lines.push("No Ollama models detected. Pull one with: ollama pull <model>".into());
+        } else {
+            lines.push("Installed models:".into());
+            for (idx, model) in models.iter().enumerate() {
+                let marker = if model == current { " (active)" } else { "" };
+                lines.push(format!("  {}. {model}{marker}", idx + 1));
+            }
+            lines.push("".into());
+            lines.push("Switch with: /model <name>".into());
+        }
+        self.show_slash_message("Ollama models", &lines);
+    }
+
+    /// Confirm a model switch.
+    pub fn show_model_selected(&mut self, model: &str) {
+        self.show_slash_message(
+            "Model updated",
+            &[
+                format!("Active model is now: {model}"),
+                "Future chat replies will use this model.".into(),
+            ],
+        );
+    }
+
+    pub fn show_slash_message(&mut self, title: &str, body_lines: &[String]) {
         self.remove_loading_lines();
         self.chat_active = false;
         self.has_chunks = true;
@@ -682,18 +628,12 @@ impl OverlayPanel {
         self.scroll_burst = 0;
         let lines = self.view_lines_mut();
         lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-        lines.push(DisplayLine {
-            text: title.into(),
-            style: LineStyle::SectionHeader,
-        });
+        lines.push(DisplayLine { text: title.into(), style: LineStyle::SectionHeader });
         for line in body_lines {
             if line.is_empty() {
                 lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
             } else {
-                lines.push(DisplayLine {
-                    text: format!("  {line}"),
-                    style: LineStyle::Body,
-                });
+                lines.push(DisplayLine { text: format!("  {line}"), style: LineStyle::Body });
             }
         }
         self.needs_redraw = true;
@@ -703,8 +643,7 @@ impl OverlayPanel {
         self.visible = true;
         self.mode = OverlayMode::Error;
         self.has_chunks = true;
-        let mut error_lines =
-            vec![DisplayLine { text: message.into(), style: LineStyle::Error }];
+        let mut error_lines = vec![DisplayLine { text: message.into(), style: LineStyle::Error }];
         if ollama {
             error_lines.push(DisplayLine {
                 text: "Start with: ollama serve".into(),
@@ -817,6 +756,10 @@ impl OverlayPanel {
                             OverlayAction::None
                         },
                         Ok(cmd @ SlashCommand::Info { .. }) => OverlayAction::RunSlashCommand(cmd),
+                        Ok(cmd @ SlashCommand::Model { .. }) => OverlayAction::RunSlashCommand(cmd),
+                        Ok(cmd @ SlashCommand::Journal { .. }) => {
+                            OverlayAction::RunSlashCommand(cmd)
+                        },
                         Err(message) => {
                             self.show_slash_message("Command error", &[message]);
                             OverlayAction::None
@@ -918,7 +861,14 @@ impl OverlayPanel {
         let theme = Theme::from_config(config, self.mode);
 
         // Full panel backdrop.
-        data.rects.push(RenderRect::new(panel_x, panel_y, panel_w, panel_h, theme.panel_bg, PANEL_ALPHA));
+        data.rects.push(RenderRect::new(
+            panel_x,
+            panel_y,
+            panel_w,
+            panel_h,
+            theme.panel_bg,
+            PANEL_ALPHA,
+        ));
 
         // Left accent stripe.
         data.rects.push(RenderRect::new(
@@ -965,8 +915,7 @@ impl OverlayPanel {
         ));
 
         let panel_start_row = (panel_y / cell_h).floor() as usize;
-        let start_col =
-            Column((panel_x / cell_w).floor() as usize + 1).0.saturating_add(1);
+        let start_col = Column((panel_x / cell_w).floor() as usize + 1).0.saturating_add(1);
         let panel_cols = ((panel_w / cell_w) as usize).saturating_sub(3).max(1);
         let total_rows = (panel_h / cell_h) as usize;
 
@@ -987,9 +936,7 @@ impl OverlayPanel {
             InteractionMode::Command => "[Command]",
             InteractionMode::Chat => "[Chat]",
         };
-        let hints = format!(
-            " Tab {mode_label}   {focus_hint}   Esc   ↑↓   ⇧Y"
-        );
+        let hints = format!(" Tab {mode_label}   {focus_hint}   Esc   ↑↓   ⇧Y");
         data.texts.push(OverlayText {
             point: Point::new(panel_start_row + 1, Column(start_col)),
             text: pad_line(&hints, panel_cols),
@@ -1035,11 +982,8 @@ impl OverlayPanel {
 
         // Scroll content lines (offset 0 = top; max = bottom / newest).
         let max_scroll = layout_lines.len().saturating_sub(content_height.max(1));
-        let scroll_start = if self.stick_to_bottom {
-            max_scroll
-        } else {
-            self.scroll_offset.min(max_scroll)
-        };
+        let scroll_start =
+            if self.stick_to_bottom { max_scroll } else { self.scroll_offset.min(max_scroll) };
         self.scroll_offset = scroll_start;
         if scroll_start >= max_scroll {
             self.stick_to_bottom = true;
@@ -1089,11 +1033,8 @@ impl OverlayPanel {
             bg: theme.input_bg,
         });
 
-        let cursor = if self.input_focus == InputFocus::Overlay && self.input_focused {
-            "▌"
-        } else {
-            " "
-        };
+        let cursor =
+            if self.input_focus == InputFocus::Overlay && self.input_focused { "▌" } else { " " };
         let input_display = if self.input_focus == InputFocus::Terminal {
             " > (terminal focus)".to_owned()
         } else if self.interaction_mode == InteractionMode::Command {
@@ -1103,10 +1044,8 @@ impl OverlayPanel {
         } else {
             format!(" > {}{}", self.input_buffer, cursor)
         };
-        for (i, input_line) in wrap_line_respecting_indent(&input_display, panel_cols)
-            .into_iter()
-            .enumerate()
-            .take(2)
+        for (i, input_line) in
+            wrap_line_respecting_indent(&input_display, panel_cols).into_iter().enumerate().take(2)
         {
             data.texts.push(OverlayText {
                 point: Point::new(panel_start_row + footer_start + 2 + i, Column(start_col)),
@@ -1116,11 +1055,8 @@ impl OverlayPanel {
             });
         }
 
-        append_actionable_hud(&mut data, size_info, config, &self.actionable_items);
-
         data
     }
-
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1168,11 +1104,7 @@ impl Theme {
             input_bg,
             input_field_bg,
             input_fg: c.footer_bar_foreground(),
-            error_fg: if mode == OverlayMode::Error {
-                c.primary.background
-            } else {
-                c.normal.red
-            },
+            error_fg: if mode == OverlayMode::Error { c.primary.background } else { c.normal.red },
         }
     }
 
@@ -1231,265 +1163,41 @@ fn pad_line(text: &str, cols: usize) -> String {
     s
 }
 
-/// Right edge of the terminal grid in pixels (accounts for padding and column count).
-fn terminal_content_right(size_info: &SizeInfo) -> f32 {
-    size_info.padding_x() + size_info.columns() as f32 * size_info.cell_width()
-}
-
-/// Draw the top-right actionable command HUD over the terminal grid (not the corner panel).
-fn append_actionable_hud(
-    data: &mut OverlayDrawData,
-    size_info: &SizeInfo,
-    config: &UiConfig,
-    items: &[String],
-) {
-    if items.is_empty() {
-        return;
-    }
-
-    let cell_w = size_info.cell_width();
-    let cell_h = size_info.cell_height();
-    let content_right = terminal_content_right(size_info);
-    let content_left = size_info.padding_x();
-    let max_hud_w = (content_right - content_left).max(cell_w);
-    let hud_w = max_hud_w.min(cell_w * HUD_MAX_COLS as f32);
-    let hud_cols = ((hud_w / cell_w) as usize).saturating_sub(2).max(8);
-    let line_count = 1 + items.len().min(HUD_MAX_ITEMS) + usize::from(items.len() > HUD_MAX_ITEMS);
-    let hud_h = cell_h * line_count as f32;
-    let hud_x = (content_right - hud_w).max(content_left);
-    let hud_y = size_info.padding_y();
-
-    let theme = Theme::from_config(config, OverlayMode::Normal);
-    let hud_bg = blend(theme.panel_bg, theme.code_fg, 0.08);
-
-    data.rects.push(RenderRect::new(hud_x, hud_y, hud_w, hud_h, hud_bg, HUD_ALPHA));
-
-    let start_col = Column(((hud_x - content_left) / cell_w).floor() as usize + 1);
-    let mut row = (hud_y / cell_h).floor() as usize;
-
-    data.texts.push(OverlayText {
-        point: Point::new(row, start_col),
-        text: pad_line(" Actions", hud_cols),
-        fg: theme.section_fg,
-        bg: hud_bg,
-    });
-    row += 1;
-
-    for (i, item) in items.iter().take(HUD_MAX_ITEMS).enumerate() {
-        let line = format!(" {}. {}", i + 1, item.trim());
-        for wrapped in wrap_line_respecting_indent(&line, hud_cols).into_iter().take(2) {
-            data.texts.push(OverlayText {
-                point: Point::new(row, start_col),
-                text: pad_line(&wrapped, hud_cols),
-                fg: theme.code_fg,
-                bg: hud_bg,
-            });
-            row += 1;
-        }
-    }
-
-    if items.len() > HUD_MAX_ITEMS {
-        data.texts.push(OverlayText {
-            point: Point::new(row, start_col),
-            text: pad_line(" …", hud_cols),
-            fg: theme.muted_fg,
-            bg: hud_bg,
-        });
-    }
-
-}
-
-fn dedupe_actionable_items(items: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for item in items {
-        let key = item.trim().to_owned();
-        if key.is_empty() || !seen.insert(key.clone()) {
-            continue;
-        }
-        out.push(key);
-        if out.len() >= HUD_MAX_ITEMS {
-            break;
-        }
-    }
-    out
-}
-
-/// Extract shell commands from prose (code fences, numbered/bullet lines).
-pub fn extract_actionable_from_prose(prose: Option<&str>) -> Vec<String> {
-    let Some(text) = prose.filter(|s| !s.is_empty()) else {
-        return Vec::new();
-    };
-
-    let mut items = Vec::new();
-    let mut in_fence = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence && !trimmed.is_empty() {
-            items.push(trimmed.to_owned());
-            continue;
-        }
-        if let Some(rest) = parse_numbered_list_line(trimmed) {
-            items.push(rest);
-        } else if let Some(rest) = trimmed.strip_prefix("- ") {
-            if looks_like_command(rest) {
-                items.push(rest.to_owned());
-            }
-        }
-    }
-
-    dedupe_actionable_items(items)
-}
-
-fn parse_numbered_list_line(trimmed: &str) -> Option<String> {
-    let digit_len = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digit_len == 0 {
-        return None;
-    }
-    let rest = trimmed[digit_len..]
-        .trim_start_matches(|c| c == '.' || c == ')')
-        .trim();
-    if looks_like_command(rest) {
-        Some(rest.to_owned())
-    } else {
-        None
-    }
-}
-
-fn looks_like_command(s: &str) -> bool {
-    let s = s.trim();
-    if s.is_empty() || s.len() > 200 {
+/// Heuristic for an all-caps section header line (e.g. `NAME`, `## OPTIONS`).
+fn is_section_header_line(line: &str) -> bool {
+    let title = line.trim().trim_start_matches('#').trim();
+    if title.is_empty() || title.len() > 60 {
         return false;
     }
-    // Skip obvious prose sentences.
-    if s.contains(" should ") || s.contains(" because ") {
-        return false;
-    }
-    s.starts_with('$')
-        || s.contains("git ")
-        || s.contains("sudo ")
-        || s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '/')
+    title.chars().all(|c| {
+        c.is_ascii_uppercase()
+            || c.is_ascii_digit()
+            || matches!(c, ' ' | '/' | '-' | '&' | '(' | ')')
+    }) && title.chars().any(|c| c.is_alphabetic())
 }
 
-pub fn actionable_items_from_response(response: &ExplainResponse) -> Vec<String> {
-    if !response.actionable_items.is_empty() {
-        return dedupe_actionable_items(response.actionable_items.clone());
-    }
-
-    let mut items = extract_actionable_from_prose(response.error_fix.as_deref());
-    for flag in &response.flags_explained {
-        if !flag.example.is_empty() {
-            items.push(flag.example.clone());
-        }
-    }
-    dedupe_actionable_items(items)
-}
-
-pub fn actionable_items_from_command_reference(response: &CommandReferenceResponse) -> Vec<String> {
-    let mut items = Vec::new();
-    for section in &response.sections {
-        if section.name.eq_ignore_ascii_case("EXAMPLES") {
-            for line in &section.lines {
-                let t = line.trim();
-                if looks_like_command(t) {
-                    items.push(t.to_owned());
-                }
-            }
-        }
-    }
-    if items.is_empty() {
-        for section in &response.sections {
-            if section.name.eq_ignore_ascii_case("SYNOPSIS") {
-                for line in &section.lines {
-                    let t = line.trim();
-                    if !t.is_empty() {
-                        items.push(t.to_owned());
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    dedupe_actionable_items(items)
-}
-
-/// Section names used in the structured response (kept in module scope for tests).
-pub(crate) const SECTION_GENERAL: &str = "General";
-pub(crate) const SECTION_CONTEXT: &str = "Context";
-pub(crate) const SECTION_FLAGS: &str = "Flags";
-pub(crate) const SECTION_FIX: &str = "Suggested fix";
-pub(crate) const SECTION_SIMILAR: &str = "Similar commands";
-
-fn format_structured_response(response: &ExplainResponse) -> Vec<DisplayLine> {
+/// Split plain-text reply prose into styled overlay lines.
+fn format_prose_with_section_headers(prose: &str) -> Vec<DisplayLine> {
     let mut lines = Vec::new();
-
-    lines.push(DisplayLine {
-        text: format!("── Command: {} ", response.command_name)
-            + &"─".repeat(20usize.saturating_sub(response.command_name.chars().count())),
-        style: LineStyle::SectionHeader,
-    });
-    lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-
-    lines.push(DisplayLine { text: SECTION_GENERAL.into(), style: LineStyle::SectionHeader });
-    push_prose_with_code_fences(&mut lines, &response.general_utility, "  ");
-    lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-
-    lines.push(DisplayLine { text: SECTION_CONTEXT.into(), style: LineStyle::SectionHeader });
-    push_prose_with_code_fences(&mut lines, &response.contextual_usage, "  ");
-
-    if !response.flags_explained.is_empty() {
-        lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-        lines.push(DisplayLine { text: SECTION_FLAGS.into(), style: LineStyle::SectionHeader });
-        for FlagExplanation { flag, meaning, example } in &response.flags_explained {
-            lines.push(DisplayLine {
-                text: format!("  {flag} — {meaning}"),
-                style: LineStyle::Body,
-            });
-            lines.push(DisplayLine {
-                text: format!("    e.g. {example}"),
-                style: LineStyle::Muted,
-            });
-        }
-    }
-
-    if let Some(fix) = &response.error_fix {
-        lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-        lines.push(DisplayLine { text: SECTION_FIX.into(), style: LineStyle::SectionHeader });
-        push_prose_with_code_fences(&mut lines, fix, "  ");
-    }
-
-    if !response.similar_commands.is_empty() {
-        lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
-        lines.push(DisplayLine {
-            text: SECTION_SIMILAR.into(),
-            style: LineStyle::SectionHeader,
-        });
-        for cmd in &response.similar_commands {
-            lines.push(DisplayLine { text: format!("  • {cmd}"), style: LineStyle::Muted });
-        }
-    }
-
-    lines
-}
-
-/// Convert prose into styled lines, switching to `LineStyle::Code` between triple-backtick
-/// fences. Fence lines themselves are dropped from the output.
-fn push_prose_with_code_fences(out: &mut Vec<DisplayLine>, prose: &str, indent: &str) {
-    let mut in_code = false;
     for body_line in prose.lines() {
-        let trimmed = body_line.trim_start();
-        if trimmed.starts_with("```") {
-            in_code = !in_code;
+        if body_line.trim().is_empty() {
+            lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
             continue;
         }
-        let style = if in_code { LineStyle::Code } else { LineStyle::Body };
-        out.push(DisplayLine { text: format!("{indent}{body_line}"), style });
+        if is_section_header_line(body_line) {
+            let title = body_line.trim().trim_start_matches('#').trim();
+            if lines.last().is_some_and(|l| !l.text.is_empty()) {
+                lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
+            }
+            lines.push(DisplayLine { text: title.to_owned(), style: LineStyle::SectionHeader });
+        } else {
+            lines.push(DisplayLine { text: body_line.to_owned(), style: LineStyle::Body });
+        }
     }
+    if lines.is_empty() {
+        lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
+    }
+    lines
 }
 
 /// Split leading whitespace from the rest of a line (for hang-indent wrapping).
@@ -1521,10 +1229,7 @@ fn wrap_line_respecting_indent(line: &str, max_cols: usize) -> Vec<String> {
         return vec![prefix];
     }
 
-    wrap_line(content, inner_cols)
-        .into_iter()
-        .map(|segment| format!("{prefix}{segment}"))
-        .collect()
+    wrap_line(content, inner_cols).into_iter().map(|segment| format!("{prefix}{segment}")).collect()
 }
 
 /// Wrap each display line to the panel width, preserving line style.
@@ -1633,10 +1338,6 @@ mod tests {
         panel.dispatch_key(&key, mods, None, false)
     }
 
-    fn dispatch_repeat(panel: &mut OverlayPanel, key: Key, mods: ModifiersState) -> OverlayAction {
-        panel.dispatch_key(&key, mods, None, true)
-    }
-
     fn dispatch_with_text(
         panel: &mut OverlayPanel,
         key: Key,
@@ -1644,19 +1345,6 @@ mod tests {
         text: &str,
     ) -> OverlayAction {
         panel.dispatch_key(&key, mods, Some(text), false)
-    }
-
-    fn make_response() -> ExplainResponse {
-        ExplainResponse {
-            command_name: "git".into(),
-            flags_explained: Vec::new(),
-            general_utility: "general utility".into(),
-            contextual_usage: "contextual usage".into(),
-            error_fix: None,
-            similar_commands: Vec::new(),
-            tool_calls_made: Vec::new(),
-            actionable_items: Vec::new(),
-        }
     }
 
     // ---- Existing core tests ----
@@ -1692,10 +1380,8 @@ mod tests {
 
     #[test]
     fn wrap_display_lines_preserves_indent_on_continuations() {
-        let lines = vec![DisplayLine {
-            text: "  hello world foo bar".into(),
-            style: LineStyle::Body,
-        }];
+        let lines =
+            vec![DisplayLine { text: "  hello world foo bar".into(), style: LineStyle::Body }];
         let wrapped = wrap_display_lines(&lines, 10);
         assert!(wrapped.len() > 1);
         assert!(wrapped.iter().all(|l| l.text.starts_with("  ")));
@@ -1722,49 +1408,6 @@ mod tests {
         assert!(draw.rects.len() >= 4);
         assert!(draw.texts.iter().any(|t| t.text.contains("Learnminal")));
         assert!(draw.texts.iter().any(|t| t.text.contains('>')));
-    }
-
-    #[test]
-    fn actionable_hud_is_top_right_of_terminal_region() {
-        let mut panel = OverlayPanel::new();
-        panel.show();
-        panel.actionable_items = vec!["git status".into(), "git add -p".into()];
-        let size = SizeInfo::new(1000., 800., 10., 20., 0., 0., false);
-        let content_right = terminal_content_right(&size);
-        let draw = panel.prepare_draw(&size, &UiConfig::default());
-
-        let hud_rect = draw
-            .rects
-            .iter()
-            .find(|r| (r.x + r.width - content_right).abs() < 0.5)
-            .expect("actionable HUD background rect");
-        assert!(hud_rect.x > size.padding_x());
-
-        let actions = draw.texts.iter().find(|t| t.text.contains("Actions")).expect("HUD title");
-        assert!(actions.point.column.0 > 1);
-        assert_eq!(actions.point.line, 0);
-    }
-
-    #[test]
-    fn actionable_hud_tracks_horizontal_resize() {
-        let mut panel = OverlayPanel::new();
-        panel.show();
-        panel.actionable_items = vec!["git status".into()];
-        let narrow = SizeInfo::new(800., 600., 10., 20., 0., 0., false);
-        let wide = SizeInfo::new(1200., 600., 10., 20., 0., 0., false);
-
-        let hud_right = |size: &SizeInfo, draw: &OverlayDrawData| {
-            let content_right = terminal_content_right(size);
-            draw.rects
-                .iter()
-                .find(|r| (r.x + r.width - content_right).abs() < 0.5)
-                .map(|r| r.x + r.width)
-                .expect("hud rect")
-        };
-
-        let narrow_draw = panel.prepare_draw(&narrow, &UiConfig::default());
-        let wide_draw = panel.prepare_draw(&wide, &UiConfig::default());
-        assert!(hud_right(&wide, &wide_draw) > hud_right(&narrow, &narrow_draw));
     }
 
     // ---- Task 5.2: Unit tests for handle_key/dispatch_key ----
@@ -1822,17 +1465,6 @@ mod tests {
     }
 
     #[test]
-    fn actionable_items_from_error_fix() {
-        let mut response = make_response();
-        response.error_fix = Some(
-            "Try:\n1. git status\n2. git add .\n```\ngit commit -m fix\n```".into(),
-        );
-        let items = actionable_items_from_response(&response);
-        assert!(items.iter().any(|i| i.contains("git status")));
-        assert!(items.iter().any(|i| i.contains("git commit")));
-    }
-
-    #[test]
     fn dismiss_error_hides_error_only_overlay() {
         let mut panel = OverlayPanel::new();
         panel.show_backend_not_running();
@@ -1845,10 +1477,7 @@ mod tests {
     fn dismiss_error_restores_content_after_follow_up_failure() {
         let mut panel = OverlayPanel::new();
         panel.show();
-        panel.chat_lines.push(DisplayLine {
-            text: "prior answer".into(),
-            style: LineStyle::Body,
-        });
+        panel.chat_lines.push(DisplayLine { text: "prior answer".into(), style: LineStyle::Body });
         panel.chat_active = true;
         panel.interaction_mode = InteractionMode::Chat;
         panel.show_sse_error("backend down");
@@ -1909,7 +1538,7 @@ mod tests {
         panel.show();
         panel.set_context(None, "git rebase -i HEAD~3".into());
         panel.has_chunks = true;
-        panel.finalize(&make_response());
+        panel.finalize_chat("Here is what it does.");
         let action = dispatch(&mut panel, key_char("y"), ModifiersState::SHIFT);
         match action {
             OverlayAction::CopySelection(text) => {
@@ -1941,8 +1570,7 @@ mod tests {
     fn dispatch_key_arrow_up_returns_none_with_ctrl() {
         let mut panel = OverlayPanel::new();
         panel.show();
-        let action =
-            dispatch(&mut panel, Key::Named(NamedKey::ArrowUp), ModifiersState::CONTROL);
+        let action = dispatch(&mut panel, Key::Named(NamedKey::ArrowUp), ModifiersState::CONTROL);
         assert_eq!(action, OverlayAction::None);
     }
 
@@ -1970,8 +1598,7 @@ mod tests {
         let mut panel = OverlayPanel::new();
         panel.show();
         panel.push_input_str("hi");
-        let action =
-            dispatch(&mut panel, Key::Named(NamedKey::Backspace), ModifiersState::empty());
+        let action = dispatch(&mut panel, Key::Named(NamedKey::Backspace), ModifiersState::empty());
         assert_eq!(action, OverlayAction::None);
         assert_eq!(panel.input_buffer, "h");
     }
@@ -2024,10 +1651,7 @@ mod tests {
         panel.show();
         panel.push_input_str("/info");
         let action = dispatch(&mut panel, Key::Named(NamedKey::Enter), ModifiersState::empty());
-        assert_eq!(
-            action,
-            OverlayAction::RunSlashCommand(SlashCommand::Info { refresh: false })
-        );
+        assert_eq!(action, OverlayAction::RunSlashCommand(SlashCommand::Info { refresh: false }));
     }
 
     #[test]
@@ -2037,11 +1661,25 @@ mod tests {
     }
 
     #[test]
-    fn slash_command_parse_clear() {
+    fn slash_command_parse_journal() {
         assert_eq!(
-            SlashCommand::parse("/clear").unwrap().unwrap(),
-            SlashCommand::Clear
+            SlashCommand::parse("/journal").unwrap().unwrap(),
+            SlashCommand::Journal { program: None, clear: false }
         );
+        assert_eq!(
+            SlashCommand::parse("/journal git").unwrap().unwrap(),
+            SlashCommand::Journal { program: Some("git".into()), clear: false }
+        );
+        assert_eq!(
+            SlashCommand::parse("/journal clear git").unwrap().unwrap(),
+            SlashCommand::Journal { program: Some("git".into()), clear: true }
+        );
+        assert!(SlashCommand::parse("/journal clear").unwrap().is_err());
+    }
+
+    #[test]
+    fn slash_command_parse_clear() {
+        assert_eq!(SlashCommand::parse("/clear").unwrap().unwrap(), SlashCommand::Clear);
     }
 
     #[test]
@@ -2049,14 +1687,12 @@ mod tests {
         let mut panel = OverlayPanel::new();
         panel.show();
         panel.interaction_mode = InteractionMode::Chat;
-        panel.chat_lines.push(DisplayLine {
-            text: "Learnminal: old reply".into(),
-            style: LineStyle::Body,
-        });
-        panel.command_lines.push(DisplayLine {
-            text: "Command explanation".into(),
-            style: LineStyle::Body,
-        });
+        panel
+            .chat_lines
+            .push(DisplayLine { text: "Learnminal: old reply".into(), style: LineStyle::Body });
+        panel
+            .command_lines
+            .push(DisplayLine { text: "Command explanation".into(), style: LineStyle::Body });
         panel.push_input_str("/clear");
         let action = dispatch(&mut panel, Key::Named(NamedKey::Enter), ModifiersState::empty());
         assert_eq!(action, OverlayAction::None);
@@ -2065,37 +1701,28 @@ mod tests {
         assert!(panel.command_lines.iter().any(|l| l.text.contains("Command explanation")));
     }
 
-    // ---- Task 6.1: Code-fence syntax highlighting in finalize ----
+    // ---- Chat rendering ----
 
     #[test]
-    fn append_chunk_buffers_json_without_flashing_raw_tokens() {
+    fn finalize_chat_styles_plain_section_titles() {
         let mut panel = OverlayPanel::new();
-        panel.show();
-        panel.set_loading();
-        panel.append_chunk("{\"command_name\":");
-        assert!(panel.stream_buffer.contains("command_name"));
-        assert!(!panel.command_lines.iter().any(|l| l.text.contains("command_name")));
-        assert!(panel.command_lines.iter().any(|l| l.text.contains("Loading")));
+        panel.show_chat();
+        panel.begin_chat_message("what is git?");
+        panel.append_chat_chunk("partial");
+        panel.finalize_chat("OVERVIEW\n\nGit tracks files.");
+
+        let label = panel.chat_lines.iter().find(|l| l.text == "Learnminal:").unwrap();
+        assert_eq!(label.style, LineStyle::SectionHeader);
+        let overview = panel.chat_lines.iter().find(|l| l.text == "OVERVIEW").unwrap();
+        assert_eq!(overview.style, LineStyle::SectionHeader);
     }
 
     #[test]
-    fn finalize_marks_code_fences_with_code_style() {
-        let mut panel = OverlayPanel::new();
-        panel.show();
-        panel.has_chunks = true;
-        let mut response = make_response();
-        response.general_utility = "intro\n```\ngit status\n```\noutro".into();
-        panel.finalize(&response);
-
-        // The fenced "git status" should be styled as Code; bookend lines as Body.
-        let code_line =
-            panel.command_lines.iter().find(|l| l.text.contains("git status")).unwrap();
-        assert_eq!(code_line.style, LineStyle::Code);
-        let intro_line =
-            panel.command_lines.iter().find(|l| l.text.trim() == "intro").unwrap();
-        assert_eq!(intro_line.style, LineStyle::Body);
-        // Fence markers themselves are dropped.
-        assert!(panel.command_lines.iter().all(|l| !l.text.contains("```")));
+    fn is_section_header_line_accepts_known_titles_and_strips_markdown() {
+        assert!(is_section_header_line("OVERVIEW"));
+        assert!(is_section_header_line("## COMMON USAGE"));
+        assert!(is_section_header_line("OPTIONS"));
+        assert!(!is_section_header_line("git status shows the working tree"));
     }
 
     proptest! {
@@ -2126,60 +1753,6 @@ mod tests {
             prop_assert!((panel_h - expected_h).abs() < 0.01);
             prop_assert!((x + panel_w - width_px as f32).abs() < 0.01);
             prop_assert!((y + panel_h - height_px as f32).abs() < 0.01);
-        }
-
-        // ---- Task 6.3: finalize renders all non-null sections. ----
-        // Property 17: section header for `error_fix` appears iff Some; section header for
-        // `similar_commands` appears iff non-empty; `Flags` appears iff non-empty.
-        #[test]
-        fn property17_finalize_renders_all_non_null_sections(
-            command_name in "[a-z]{1,16}",
-            general in "[a-zA-Z0-9 ]{1,40}",
-            context in "[a-zA-Z0-9 ]{1,40}",
-            include_fix in any::<bool>(),
-            fix_text in "[a-zA-Z0-9 ]{1,40}",
-            similar in prop::collection::vec("[a-z]{1,8}", 0..4),
-            flag_count in 0usize..4,
-        ) {
-            let flags = (0..flag_count)
-                .map(|i| FlagExplanation {
-                    flag: format!("--f{i}"),
-                    meaning: format!("meaning{i}"),
-                    example: format!("ex{i}"),
-                })
-                .collect::<Vec<_>>();
-
-            let response = ExplainResponse {
-                command_name: command_name.clone(),
-                flags_explained: flags,
-                general_utility: general,
-                contextual_usage: context,
-                error_fix: if include_fix { Some(fix_text.clone()) } else { None },
-                similar_commands: similar.clone(),
-                tool_calls_made: Vec::new(),
-                actionable_items: Vec::new(),
-            };
-
-            let mut panel = OverlayPanel::new();
-            panel.show();
-            panel.has_chunks = true;
-            panel.finalize(&response);
-
-            let texts: Vec<&str> = panel.command_lines.iter().map(|l| l.text.as_str()).collect();
-            let has = |needle: &str| texts.iter().any(|t| t == &needle);
-
-            // Always-present sections.
-            prop_assert!(has(SECTION_GENERAL), "missing General section");
-            prop_assert!(has(SECTION_CONTEXT), "missing Context section");
-            prop_assert!(
-                texts.iter().any(|t| t.contains(&command_name)),
-                "missing command_name in title row",
-            );
-
-            // Conditional sections — present iff the source data is non-empty.
-            prop_assert_eq!(has(SECTION_FIX), include_fix);
-            prop_assert_eq!(has(SECTION_SIMILAR), !similar.is_empty());
-            prop_assert_eq!(has(SECTION_FLAGS), flag_count > 0);
         }
     }
 }

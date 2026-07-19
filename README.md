@@ -1,6 +1,6 @@
 # Learnminal
 
-An agentic terminal you can learn with — an Alacritty fork with AI-powered explanations (`Ctrl+Shift+E`).
+An agentic terminal you can learn with — an Alacritty fork with an Ollama-powered chat overlay (`Ctrl+Shift+E`).
 
 ## Build and run
 
@@ -20,11 +20,19 @@ The release binary is named **learnminal** (not `alacritty`) so you can tell it 
 which learnminal   # should point at this repo's target/release/learnminal
 ```
 
-## AI backend (stub for testing)
+## AI chat
 
 ```bash
-pip install fastapi uvicorn pydantic
-python ai-backend/server_stub.py
+# Start Ollama (separate terminal)
+ollama serve
 ```
 
-Then press `Ctrl+Shift+E` in Learnminal.
+Then press `Ctrl+Shift+E` in Learnminal to open Chat and ask a question about your terminal. Opening Chat preloads the active model so the first response starts faster. The app talks directly to Ollama; no Python sidecar is required. When you submit a chat question, Learnminal may include a concise `man`/`--help` excerpt for the last command as hidden context.
+
+Slash commands in the overlay:
+
+- `/model list` — show installed Ollama models
+- `/model <name>` — switch the active model
+- `/info` — show cached system environment
+
+Optional: set a default model with `LEARNMINAL_OLLAMA_MODEL` or persist a choice via `/model`.

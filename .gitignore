@@ -2,19 +2,6 @@
 target/
 /target/
 
-# Python (ai-backend)
-__pycache__/
-*.py[cod]
-*$py.class
-.Python
-.venv/
-venv/
-.env
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
 # macOS
 .DS_Store
 

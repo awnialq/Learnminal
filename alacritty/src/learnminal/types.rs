@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-/// Snapshot of terminal state sent to the Python backend.
+/// Snapshot of terminal state gathered for the chat prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalContext {
     pub visible_text: String,
@@ -32,29 +31,7 @@ impl Default for TerminalContext {
     }
 }
 
-/// JSON payload POSTed to `http://127.0.0.1:8765/explain`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExplainRequest {
-    pub request_id: String,
-    pub timestamp: i64,
-    pub terminal: TerminalContext,
-    /// User follow-up question from the overlay input field; omitted on first explain.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub follow_up_question: Option<String>,
-}
-
-impl ExplainRequest {
-    pub fn from_context(
-        ctx: TerminalContext,
-        request_id: String,
-        timestamp: i64,
-        follow_up_question: Option<String>,
-    ) -> Self {
-        Self { request_id, timestamp, terminal: ctx, follow_up_question }
-    }
-}
-
-/// System environment snapshot from `GET /system-info` (overlay `/info`).
+/// System environment snapshot for the overlay `/info` command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemInfo {
     #[serde(default)]
@@ -65,7 +42,7 @@ pub struct SystemInfo {
     pub shell: String,
     #[serde(default)]
     pub package_managers: Vec<String>,
-    /// `{ "pacman": ["vim", "git", ...], "pip3": ["numpy", ...] }` from last system scan.
+    /// `{ "pacman": ["vim", "git", ...] }` — always empty now (inventory dropped).
     #[serde(default)]
     pub installed_packages: std::collections::HashMap<String, Vec<String>>,
     #[serde(default)]
@@ -79,91 +56,60 @@ pub struct SystemInfo {
 }
 
 impl SystemInfo {
-    /// Whether the backend returned enough data for `/info` and agent prompts.
+    /// Whether enough data was collected for `/info`.
     pub fn is_complete(&self) -> bool {
         !self.os.is_empty() && self.collected_at.is_some()
     }
 }
 
-/// Per-flag breakdown in the structured response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FlagExplanation {
-    pub flag: String,
-    pub meaning: String,
-    pub example: String,
+/// Provenance of the reference text injected into the chat prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceSource {
+    Man,
+    Help,
+    Package,
+    Docs,
+    None,
 }
 
-/// Structured educational response from the ReAct agent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExplainResponse {
-    pub command_name: String,
-    pub flags_explained: Vec<FlagExplanation>,
-    pub general_utility: String,
-    pub contextual_usage: String,
-    pub error_fix: Option<String>,
-    #[serde(default)]
-    pub similar_commands: Vec<String>,
-    #[serde(default)]
-    pub tool_calls_made: Vec<String>,
-    /// Shell-ready commands for the top-right actionable HUD (max 5).
-    #[serde(default)]
-    pub actionable_items: Vec<String>,
-}
+impl ReferenceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReferenceSource::Man => "man",
+            ReferenceSource::Help => "help",
+            ReferenceSource::Package => "package",
+            ReferenceSource::Docs => "docs",
+            ReferenceSource::None => "none",
+        }
+    }
 
-/// Incremental SSE text chunk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamChunk {
-    pub text: String,
-    pub chunk_index: u32,
-}
-
-/// Section in a command reference (Command mode).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReferenceSection {
-    pub name: String,
-    pub lines: Vec<String>,
-}
-
-/// Formatted man/--help from `POST /command-reference`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandReferenceResponse {
-    pub program: String,
-    pub source: String,
-    pub title: String,
-    pub sections: Vec<ReferenceSection>,
-}
-
-/// JSON payload POSTed to `http://127.0.0.1:8765/chat`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChatRequest {
-    pub request_id: String,
-    pub timestamp: i64,
-    pub terminal: TerminalContext,
-    pub message: String,
-}
-
-impl ChatRequest {
-    pub fn from_context(ctx: TerminalContext, request_id: String, timestamp: i64, message: String) -> Self {
-        Self { request_id, timestamp, terminal: ctx, message }
+    pub fn label(self) -> &'static str {
+        match self {
+            ReferenceSource::Man => "man",
+            ReferenceSource::Help => "--help",
+            ReferenceSource::Package => "package info",
+            ReferenceSource::Docs => "official docs",
+            ReferenceSource::None => "none",
+        }
     }
 }
 
-/// Parsed chat SSE done event.
+/// Budgeted reference text for a program (man/help/package/docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatDoneEvent {
-    pub reply: String,
-    pub actionable_items: Vec<String>,
+pub struct ReferenceContext {
+    pub program: String,
+    pub source: ReferenceSource,
+    pub body: String,
 }
 
-/// Parse chat SSE done event `{"reply": "...", "actionable_items": [...], "done": true}`.
-pub fn parse_chat_done_event(data: &str) -> Option<ChatDoneEvent> {
-    let envelope: serde_json::Value = serde_json::from_str(data).ok()?;
-    if !envelope.get("done").and_then(serde_json::Value::as_bool).unwrap_or(false) {
-        return None;
+impl ReferenceContext {
+    pub fn empty(program: impl Into<String>) -> Self {
+        Self { program: program.into(), source: ReferenceSource::None, body: String::new() }
     }
-    let reply = envelope.get("reply").and_then(|v| v.as_str())?.to_owned();
-    let actionable_items = string_list(envelope.get("actionable_items"));
-    Some(ChatDoneEvent { reply, actionable_items })
+
+    pub fn has_body(&self) -> bool {
+        !self.body.trim().is_empty()
+    }
 }
 
 /// First token of a shell command line (program name).
@@ -172,88 +118,61 @@ pub fn extract_program_name(last_command: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    // Simple split; Python uses shlex — good enough for common cases.
-    trimmed.split_whitespace().next().unwrap_or("").to_owned()
+    let token = trimmed.split_whitespace().next().unwrap_or("");
+    // Strip path: `/usr/bin/git` → `git`
+    std::path::Path::new(token)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| token.to_owned())
 }
 
-/// Strip optional markdown code fences from model JSON output.
-pub fn strip_json_fences(text: &str) -> String {
-    let text = text.trim();
-    if !text.starts_with("```") {
-        return text.to_owned();
+/// Resolve the program from the last command, else a shell-looking token in the user message.
+pub fn resolve_program(last_command: &str, user_message: &str) -> String {
+    let from_cmd = extract_program_name(last_command);
+    if !from_cmd.is_empty() {
+        return from_cmd;
     }
-    let mut lines: Vec<&str> = text.lines().skip(1).collect();
-    if lines.last().is_some_and(|l| l.trim().starts_with("```")) {
-        lines.pop();
+    extract_program_from_message(user_message)
+}
+
+fn extract_program_from_message(message: &str) -> String {
+    // Prefer backtick/`$ ` command snippets, then bare tokens that look like programs.
+    for segment in message.split('`') {
+        let candidate = extract_program_name(segment.trim_start_matches('$'));
+        if looks_like_program(&candidate) {
+            return candidate;
+        }
     }
-    lines.join("\n")
-}
-
-fn string_field(obj: &serde_json::Map<String, Value>, key: &str) -> String {
-    obj.get(key)
-        .and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
-            Value::Bool(b) => Some(b.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
-fn optional_string_field(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
-    let s = string_field(obj, key);
-    if s.is_empty() { None } else { Some(s) }
-}
-
-fn string_list(value: Option<&Value>) -> Vec<String> {
-    match value {
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect(),
-        Some(Value::String(s)) => vec![s.clone()],
-        _ => Vec::new(),
+    for token in message.split_whitespace() {
+        let cleaned = token.trim_matches(|c: char| {
+            matches!(c, ',' | '.' | ';' | ':' | '?' | '!' | '"' | '\'' | '(' | ')')
+        });
+        let candidate = extract_program_name(cleaned);
+        if looks_like_program(&candidate) {
+            return candidate;
+        }
     }
+    String::new()
 }
 
-fn parse_flags(value: Option<&Value>) -> Vec<FlagExplanation> {
-    let Some(Value::Array(arr)) = value else { return Vec::new() };
-    arr.iter()
-        .filter_map(|item| {
-            let obj = item.as_object()?;
-            Some(FlagExplanation {
-                flag: obj.get("flag").and_then(|v| v.as_str())?.to_owned(),
-                meaning: obj.get("meaning").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                example: obj.get("example").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-            })
-        })
-        .collect()
-}
-
-/// Parse LLM / backend JSON into `ExplainResponse`, tolerating minor schema drift.
-pub fn parse_explain_response_lenient(value: &serde_json::Value) -> Option<ExplainResponse> {
-    let obj = value.as_object()?;
-    let command_name = string_field(obj, "command_name");
-    Some(ExplainResponse {
-        command_name: if command_name.is_empty() { "unknown".into() } else { command_name },
-        flags_explained: parse_flags(obj.get("flags_explained")),
-        general_utility: string_field(obj, "general_utility"),
-        contextual_usage: string_field(obj, "contextual_usage"),
-        error_fix: optional_string_field(obj, "error_fix"),
-        similar_commands: string_list(obj.get("similar_commands")),
-        tool_calls_made: string_list(obj.get("tool_calls_made")),
-        actionable_items: string_list(obj.get("actionable_items")),
-    })
-}
-
-/// Parse an SSE `data:` payload containing `{"structured": {...}, "done": true}`.
-pub fn parse_structured_done_event(data: &str) -> Option<ExplainResponse> {
-    let envelope: serde_json::Value = serde_json::from_str(data).ok()?;
-    if !envelope.get("done").and_then(serde_json::Value::as_bool).unwrap_or(false) {
-        return None;
+fn looks_like_program(name: &str) -> bool {
+    if name.is_empty() || name.len() > 40 {
+        return false;
     }
-    let structured = envelope.get("structured")?;
-    parse_explain_response_lenient(structured)
+    // Skip common English words that are not programs.
+    const STOP: &[&str] = &[
+        "how", "do", "i", "the", "a", "an", "to", "for", "with", "what", "why", "is", "my", "this",
+        "that", "and", "or", "of", "in", "on", "it", "me", "can", "you", "please", "help", "explain",
+        "about", "command", "error", "failed", "using", "fix", "something", "specific", "again",
+        "does", "did", "not", "work", "working", "want", "need", "should", "could", "would",
+        "when", "where", "which", "who", "from", "into", "just", "like", "make", "get", "set",
+        "run", "use", "used", "try", "tell", "show", "give",
+    ];
+    let lower = name.to_ascii_lowercase();
+    if STOP.contains(&lower.as_str()) {
+        return false;
+    }
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 #[cfg(test)]
@@ -262,8 +181,8 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    fn system_info_complete_when_os_and_collected_at_present() {
-        let info = SystemInfo {
+    fn system_info_complete_requires_os_and_collected_at() {
+        let mut info = SystemInfo {
             os: "Linux".into(),
             arch: String::new(),
             shell: String::new(),
@@ -275,35 +194,27 @@ mod tests {
             collected_at_display: None,
         };
         assert!(info.is_complete());
-        let empty = SystemInfo {
-            os: String::new(),
-            arch: String::new(),
-            shell: String::new(),
-            package_managers: Vec::new(),
-            installed_packages: std::collections::HashMap::new(),
-            installed_packages_total: None,
-            installed_tools: Vec::new(),
-            collected_at: None,
-            collected_at_display: None,
-        };
-        assert!(!empty.is_complete());
+        info.collected_at = None;
+        assert!(!info.is_complete());
+        info.collected_at = Some(1);
+        info.os = String::new();
+        assert!(!info.is_complete());
     }
 
     #[test]
-    fn parse_structured_done_tolerates_malformed_flags() {
-        let data = r#"{"structured":{"command_name":"git","flags_explained":["-a"],"general_utility":"utility","contextual_usage":"context","error_fix":null,"similar_commands":[],"tool_calls_made":[]},"done":true}"#;
-        let response = parse_structured_done_event(data).expect("parses leniently");
-        assert_eq!(response.command_name, "git");
-        assert!(response.flags_explained.is_empty());
-        assert_eq!(response.general_utility, "utility");
+    fn extract_program_name_takes_first_token() {
+        assert_eq!(extract_program_name("git rebase -i HEAD~3"), "git");
+        assert_eq!(extract_program_name("   ls -la"), "ls");
+        assert_eq!(extract_program_name(""), "");
+        assert_eq!(extract_program_name("/usr/bin/git status"), "git");
     }
 
     #[test]
-    fn parse_explain_response_lenient_from_json_object() {
-        let json = r#"{"command_name":"ls","flags_explained":[],"general_utility":"list","contextual_usage":"here","error_fix":null,"similar_commands":[],"tool_calls_made":[]}"#;
-        let value: Value = serde_json::from_str(json).unwrap();
-        let response = parse_explain_response_lenient(&value).unwrap();
-        assert_eq!(response.command_name, "ls");
+    fn resolve_program_falls_back_to_message() {
+        assert_eq!(resolve_program("git status", "why?"), "git");
+        assert_eq!(resolve_program("", "how do I use `kubectl get pods`?"), "kubectl");
+        assert_eq!(resolve_program("", "explain docker compose"), "docker");
+        assert!(resolve_program("", "how do I fix this error?").is_empty());
     }
 
     fn arb_terminal_context() -> impl Strategy<Value = TerminalContext> {
@@ -317,8 +228,8 @@ mod tests {
             any::<u16>(),
             any::<u16>(),
         )
-            .prop_map(|(visible_text, selected_text, last_command, last_command_output, cwd, exit_code, rows, cols)| {
-                TerminalContext {
+            .prop_map(
+                |(
                     visible_text,
                     selected_text,
                     last_command,
@@ -327,90 +238,27 @@ mod tests {
                     exit_code,
                     rows,
                     cols,
-                }
-            })
+                )| {
+                    TerminalContext {
+                        visible_text,
+                        selected_text,
+                        last_command,
+                        last_command_output,
+                        cwd,
+                        exit_code,
+                        rows,
+                        cols,
+                    }
+                },
+            )
     }
 
     proptest! {
-        // Property 5: ExplainRequest serialization is schema-complete for any
-        // TerminalContext. Asserts every required field from ipc-contract/schema.json
-        // is present in the JSON with the correct type.
         #[test]
-        fn property5_explain_request_serialization_is_schema_complete(
-            ctx in arb_terminal_context(),
-            request_id in "[a-zA-Z0-9-]{1,40}",
-            timestamp in any::<i64>(),
-        ) {
-            let request = ExplainRequest::from_context(ctx, request_id, timestamp, None);
-
-            let json = serde_json::to_string(&request).expect("serialize ExplainRequest");
-            let value: Value = serde_json::from_str(&json).expect("parse JSON");
-            let obj = value.as_object().expect("ExplainRequest is a JSON object");
-
-            // ---- ExplainRequest required fields ----
-            prop_assert!(
-                obj.get("request_id").is_some_and(|v| v.is_string()),
-                "request_id missing or not a string",
-            );
-            prop_assert!(
-                obj.get("timestamp").is_some_and(|v| v.is_i64()),
-                "timestamp missing or not an integer",
-            );
-            let term = obj
-                .get("terminal")
-                .and_then(|v| v.as_object())
-                .expect("terminal is a JSON object");
-
-            // ---- TerminalContext required fields ----
-            prop_assert!(
-                term.get("visible_text").is_some_and(|v| v.is_string()),
-                "visible_text missing or not a string",
-            );
-            // selected_text must be present and either string or null.
-            prop_assert!(term.contains_key("selected_text"));
-            let selected = &term["selected_text"];
-            prop_assert!(
-                selected.is_null() || selected.is_string(),
-                "selected_text must be string or null",
-            );
-
-            prop_assert!(
-                term.get("last_command").is_some_and(|v| v.is_string()),
-                "last_command missing or not a string",
-            );
-            prop_assert!(
-                term.get("last_command_output").is_some_and(|v| v.is_string()),
-                "last_command_output missing or not a string",
-            );
-            prop_assert!(
-                term.get("cwd").is_some_and(|v| v.is_string()),
-                "cwd missing or not a string",
-            );
-
-            prop_assert!(term.contains_key("exit_code"));
-            let exit = &term["exit_code"];
-            prop_assert!(
-                exit.is_null() || exit.is_i64(),
-                "exit_code must be integer or null",
-            );
-
-            prop_assert!(
-                term.get("rows").is_some_and(|v| v.is_u64()),
-                "rows missing or not a non-negative integer",
-            );
-            prop_assert!(
-                term.get("cols").is_some_and(|v| v.is_u64()),
-                "cols missing or not a non-negative integer",
-            );
-        }
-
-        // Round-trip: any TerminalContext serializes and deserializes to itself.
-        #[test]
-        fn explain_request_round_trips(ctx in arb_terminal_context()) {
-            let request = ExplainRequest::from_context(ctx, "req".into(), 0, None);
-            let json = serde_json::to_string(&request).unwrap();
-            let parsed: ExplainRequest = serde_json::from_str(&json).unwrap();
-            prop_assert_eq!(request, parsed);
+        fn terminal_context_round_trips(ctx in arb_terminal_context()) {
+            let json = serde_json::to_string(&ctx).unwrap();
+            let parsed: TerminalContext = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(ctx, parsed);
         }
     }
 }

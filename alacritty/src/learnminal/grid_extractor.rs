@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use alacritty_terminal::grid::{Dimensions, Grid, GridCell};
 use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::viewport_to_point;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::viewport_to_point;
 
 use crate::learnminal::types::TerminalContext;
 
@@ -48,7 +48,11 @@ pub fn read_last_command() -> Option<String> {
     } else {
         raw
     };
-    if command.is_empty() { None } else { Some(command) }
+    if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    }
 }
 
 /// Extract terminal context from the visible grid, with middle-truncation and panic safety.
@@ -339,7 +343,8 @@ mod tests {
 
     #[test]
     fn no_truncation_at_boundary() {
-        let lines: Vec<String> = (0..PREFIX_LINES + SUFFIX_LINES).map(|i| format!("line{i}")).collect();
+        let lines: Vec<String> =
+            (0..PREFIX_LINES + SUFFIX_LINES).map(|i| format!("line{i}")).collect();
         let text = truncate_lines(&lines);
         assert!(!text.contains("truncated"));
         assert_eq!(text.lines().count(), PREFIX_LINES + SUFFIX_LINES);
@@ -482,9 +487,7 @@ mod tests {
 
     #[test]
     fn command_block_empty_when_only_one_prompt() {
-        let lines: Vec<String> = vec![
-            "user@host $ git status".into(),
-        ];
+        let lines: Vec<String> = vec!["user@host $ git status".into()];
         let (cmd, out) = extract_command_block(&lines);
         assert!(cmd.is_empty());
         assert!(out.is_empty());
@@ -492,10 +495,7 @@ mod tests {
 
     #[test]
     fn command_block_empty_output_when_command_produced_no_output() {
-        let lines: Vec<String> = vec![
-            "user@host $ clear".into(),
-            "user@host $ ".into(),
-        ];
+        let lines: Vec<String> = vec!["user@host $ clear".into(), "user@host $ ".into()];
         let (cmd, out) = extract_command_block(&lines);
         assert_eq!(cmd, "clear");
         assert!(out.is_empty());

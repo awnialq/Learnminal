@@ -156,6 +156,8 @@ pub trait ActionContext<T: EventListener> {
     fn schedule_learnminal_error_dismiss(&mut self) {}
 
     fn cancel_learnminal_error_dismiss(&mut self) {}
+
+    fn cancel_learnminal_inflight(&mut self) {}
 }
 
 impl Action {

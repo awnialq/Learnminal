@@ -58,9 +58,15 @@ use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
+use crate::learnminal::journal;
+use crate::learnminal::manpage::{reference_context, DEFAULT_CONTEXT_BUDGET};
+use crate::learnminal::prompt::build_chat_prompt;
+use crate::learnminal::sysinfo;
+use crate::learnminal::types::resolve_program;
+use crate::learnminal::verify::{append_footer, verify_reply};
 use crate::learnminal::{
-    extract_context, read_last_exit_code, ExplainResponse, IpcClient, IpcError, SlashCommand,
-    SystemInfo, TerminalContext,
+    extract_context, read_last_exit_code, OllamaClient, OllamaError, SlashCommand, SystemInfo,
+    TerminalContext,
 };
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer, MessageType};
@@ -582,22 +588,64 @@ pub enum EventType {
     Learnminal(LearnminalEvent),
 }
 
-/// Events from the Learnminal IPC background thread.
+/// Events from the Learnminal Ollama background thread.
 #[derive(Debug, Clone)]
 pub enum LearnminalEvent {
-    Chunk(String),
-    Done(ExplainResponse),
-    CommandReference(crate::learnminal::types::CommandReferenceResponse),
-    ChatChunk(String),
-    ChatDone(crate::learnminal::types::ChatDoneEvent),
-    /// Stream ended after chunks but without a parsed structured `done` event.
-    StreamIncomplete,
-    SseError(String),
-    BackendNotRunning,
-    Timeout,
-    SystemInfo(SystemInfo),
+    ChatChunk {
+        generation: u64,
+        text: String,
+    },
+    ChatDone {
+        generation: u64,
+        reply: String,
+    },
+    ModelsListed {
+        generation: u64,
+        models: Vec<String>,
+        current: String,
+    },
+    ModelSelected {
+        generation: u64,
+        model: String,
+    },
+    /// Stream ended after chunks but without a terminating `done` line.
+    StreamIncomplete {
+        generation: u64,
+    },
+    SseError {
+        generation: u64,
+        message: String,
+    },
+    BackendNotRunning {
+        generation: u64,
+    },
+    Timeout {
+        generation: u64,
+    },
+    SystemInfo {
+        generation: u64,
+        info: SystemInfo,
+    },
     /// Hide transient overlay error after `LEARNMINAL_ERROR_DISMISS` (Req 11).
     DismissError,
+}
+
+fn learnminal_ollama_error_event(error: OllamaError, generation: u64) -> LearnminalEvent {
+    match error {
+        OllamaError::NotRunning => LearnminalEvent::BackendNotRunning { generation },
+        OllamaError::Timeout => LearnminalEvent::Timeout { generation },
+        OllamaError::IncompleteStream => LearnminalEvent::StreamIncomplete { generation },
+        OllamaError::StreamError(message) => LearnminalEvent::SseError { generation, message },
+    }
+}
+
+fn truncate_for_display(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_owned();
+    }
+    let kept: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 /// How long overlay error panels stay visible before auto-dismiss (Req 11).
@@ -974,51 +1022,17 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     fn trigger_explain(&mut self) {
-        info!("Learnminal: Explain triggered (Ctrl+Shift+E)");
+        info!("Learnminal: Chat triggered (Ctrl+Shift+E)");
 
         let terminal_ctx = self.current_terminal_context();
 
-        if terminal_ctx.visible_text.is_empty() && terminal_ctx.last_command.is_empty() {
-            self.display.learnminal_overlay.show_empty_context();
-            self.message_buffer.push(Message::new(
-                "Could not read terminal content. Try selecting text manually.".into(),
-                MessageType::Warning,
-            ));
-            self.schedule_learnminal_error_dismiss();
-            self.request_redraw();
-            return;
-        }
-
         self.cancel_learnminal_error_dismiss();
-        self.display.learnminal_overlay.set_context(
-            terminal_ctx.selected_text.clone(),
-            terminal_ctx.last_command.clone(),
-        );
-        self.display.learnminal_overlay.show();
-        self.display.learnminal_overlay.set_loading();
+        self.display
+            .learnminal_overlay
+            .set_context(terminal_ctx.selected_text.clone(), terminal_ctx.last_command.clone());
+        self.display.learnminal_overlay.show_chat();
+        self.spawn_learnminal_preload();
         self.request_redraw();
-
-        let program = crate::learnminal::types::extract_program_name(&terminal_ctx.last_command);
-        if program.is_empty() {
-            self.display.learnminal_overlay.show_command_reference(
-                &crate::learnminal::types::CommandReferenceResponse {
-                    program: String::new(),
-                    source: "none".into(),
-                    title: "No command detected".into(),
-                    sections: vec![crate::learnminal::types::ReferenceSection {
-                        name: "Hint".into(),
-                        lines: vec![
-                            "Could not detect a command in the terminal.".into(),
-                            "Run a command, then press Ctrl+Shift+E again.".into(),
-                        ],
-                    }],
-                },
-            );
-            self.request_redraw();
-            return;
-        }
-
-        self.spawn_learnminal_command_reference(program);
     }
 
     fn trigger_chat(&mut self, query: String) {
@@ -1049,6 +1063,15 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 info!("Learnminal: /info slash command (refresh={refresh})");
                 self.display.learnminal_overlay.begin_slash_command("/info");
                 self.spawn_learnminal_system_info(refresh);
+            },
+            SlashCommand::Model { name, list } => {
+                self.display.learnminal_overlay.begin_slash_command("/model");
+                self.spawn_learnminal_model(name, list);
+            },
+            SlashCommand::Journal { program, clear } => {
+                info!("Learnminal: /journal slash command");
+                self.display.learnminal_overlay.begin_slash_command("/journal");
+                self.run_learnminal_journal(program, clear);
             },
             SlashCommand::Help | SlashCommand::Clear => {},
         }
@@ -1652,16 +1675,30 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     fn cancel_learnminal_error_dismiss(&mut self) {
-        let timer_id =
-            TimerId::new(Topic::LearnminalErrorDismiss, self.display.window.id());
+        let timer_id = TimerId::new(Topic::LearnminalErrorDismiss, self.display.window.id());
         self.scheduler.unschedule(timer_id);
+    }
+
+    fn cancel_learnminal_inflight(&mut self) {
+        self.display.learnminal_overlay.bump_request_generation();
+        self.cancel_learnminal_backend_streams();
     }
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
+    fn cancel_learnminal_backend_streams(&self) {
+        // Stop the active stream (the generation guard drops late tokens) and
+        // ask Ollama to unload the active model from VRAM.
+        alacritty_terminal::thread::spawn_named("learnminal cancel", move || {
+            let client = OllamaClient::default_client();
+            if let Ok((active, _)) = client.resolve_active_model() {
+                client.unload(&active);
+            }
+        });
+    }
+
     fn current_terminal_context(&self) -> TerminalContext {
-        let selection =
-            self.terminal.selection.as_ref().and_then(|s| s.to_range(self.terminal));
+        let selection = self.terminal.selection.as_ref().and_then(|s| s.to_range(self.terminal));
 
         #[cfg(not(windows))]
         let cwd = foreground_process_path(self.master_fd, self.shell_pid)
@@ -1673,86 +1710,188 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         extract_context(self.terminal.grid(), selection, &cwd, read_last_exit_code())
     }
 
-    fn spawn_learnminal_system_info(&self, refresh: bool) {
+    fn spawn_learnminal_system_info(&self, _refresh: bool) {
         let proxy = self.event_proxy.clone();
         let window_id = self.display.window.id();
+        let generation = self.display.learnminal_overlay.bump_request_generation();
 
         alacritty_terminal::thread::spawn_named("learnminal system-info", move || {
-            let client = IpcClient::default_client();
-            let result = client.system_info(refresh);
+            let event = LearnminalEvent::SystemInfo { generation, info: sysinfo::collect() };
+            let _ = proxy.send_event(Event::new(EventType::Learnminal(event), window_id));
+        });
+    }
 
-            let event = match result {
-                Ok(info) => LearnminalEvent::SystemInfo(info),
-                Err(err) => match err {
-                    IpcError::BackendNotRunning => LearnminalEvent::BackendNotRunning,
-                    IpcError::Timeout => LearnminalEvent::Timeout,
-                    IpcError::StreamError(message) => LearnminalEvent::SseError(message),
-                    IpcError::IncompleteStream => LearnminalEvent::SseError(
-                        "Unexpected empty response from system-info.".into(),
-                    ),
-                },
+    fn spawn_learnminal_preload(&self) {
+        let proxy = self.event_proxy.clone();
+        let window_id = self.display.window.id();
+        let generation = self.display.learnminal_overlay.bump_request_generation();
+
+        alacritty_terminal::thread::spawn_named("learnminal preload", move || {
+            let client = OllamaClient::default_client();
+            let result = client.resolve_active_model().and_then(|(model, _)| client.load(&model));
+            if let Err(error) = result {
+                let event = learnminal_ollama_error_event(error, generation);
+                let _ = proxy.send_event(Event::new(EventType::Learnminal(event), window_id));
+            }
+        });
+    }
+
+    fn spawn_learnminal_model(&self, name: Option<String>, list: bool) {
+        let proxy = self.event_proxy.clone();
+        let window_id = self.display.window.id();
+        let generation = self.display.learnminal_overlay.bump_request_generation();
+
+        alacritty_terminal::thread::spawn_named("learnminal model", move || {
+            let client = OllamaClient::default_client();
+            let event = if list || name.is_none() {
+                match client.resolve_active_model() {
+                    Ok((current, models)) => {
+                        LearnminalEvent::ModelsListed { generation, models, current }
+                    },
+                    Err(err) => learnminal_ollama_error_event(err, generation),
+                }
+            } else {
+                match client.set_active_model(name.as_deref().unwrap_or_default()) {
+                    Ok(model) => match client.load(&model) {
+                        Ok(()) => LearnminalEvent::ModelSelected { generation, model },
+                        Err(err) => learnminal_ollama_error_event(err, generation),
+                    },
+                    Err(err) => learnminal_ollama_error_event(err, generation),
+                }
             };
             let _ = proxy.send_event(Event::new(EventType::Learnminal(event), window_id));
         });
     }
 
-    fn spawn_learnminal_command_reference(&self, program: String) {
-        let proxy = self.event_proxy.clone();
-        let window_id = self.display.window.id();
-
-        alacritty_terminal::thread::spawn_named("learnminal command-ref", move || {
-            let client = IpcClient::default_client();
-            let event = match client.command_reference(&program) {
-                Ok(response) => LearnminalEvent::CommandReference(response),
-                Err(IpcError::BackendNotRunning) => LearnminalEvent::BackendNotRunning,
-                Err(IpcError::Timeout) => LearnminalEvent::Timeout,
-                Err(IpcError::StreamError(message)) => LearnminalEvent::SseError(message),
-                Err(IpcError::IncompleteStream) => LearnminalEvent::SseError(
-                    "Incomplete response from command reference.".into(),
-                ),
+    fn run_learnminal_journal(&mut self, program: Option<String>, clear: bool) {
+        if clear {
+            let Some(program) = program else {
+                self.display.learnminal_overlay.show_slash_message(
+                    "Journal",
+                    &["Usage: /journal clear <program>".into()],
+                );
+                return;
             };
-            let _ = proxy.send_event(Event::new(EventType::Learnminal(event), window_id));
-        });
+            let n = journal::clear_program_default(&program);
+            self.display.learnminal_overlay.show_slash_message(
+                "Journal",
+                &[format!("Cleared {n} note(s) for {program}.")],
+            );
+            return;
+        }
+
+        match program {
+            None => {
+                let programs = journal::list_programs_default(30);
+                if programs.is_empty() {
+                    self.display.learnminal_overlay.show_slash_message(
+                        "Journal",
+                        &["No saved notes yet. Chat about a command to create one.".into()],
+                    );
+                    return;
+                }
+                let lines: Vec<String> = programs
+                    .into_iter()
+                    .map(|p| format!("{} — {} note(s)", p.program, p.note_count))
+                    .collect();
+                self.display.learnminal_overlay.show_slash_message("Journal programs", &lines);
+            },
+            Some(program) => {
+                let notes = journal::recent_for_program_default(&program, 10);
+                if notes.is_empty() {
+                    self.display.learnminal_overlay.show_slash_message(
+                        "Journal",
+                        &[format!("No notes for {program}.")],
+                    );
+                    return;
+                }
+                let mut lines = Vec::new();
+                for note in notes {
+                    let q = truncate_for_display(&note.question, 120);
+                    let a = truncate_for_display(&note.reply, 200);
+                    lines.push(format!("Q: {q}"));
+                    lines.push(format!("A: {a}"));
+                    lines.push(String::new());
+                }
+                self.display.learnminal_overlay.show_slash_message(
+                    &format!("Journal — {program}"),
+                    &lines,
+                );
+            },
+        }
     }
 
     fn spawn_learnminal_chat(&self, terminal_ctx: TerminalContext, message: String) {
         let proxy = self.event_proxy.clone();
         let window_id = self.display.window.id();
+        let generation = self.display.learnminal_overlay.bump_request_generation();
 
         alacritty_terminal::thread::spawn_named("learnminal chat", move || {
-            let client = IpcClient::default_client();
-            let result = client.chat(
-                &terminal_ctx,
-                &message,
-                |chunk| {
-                    let _ = proxy.send_event(Event::new(
-                        EventType::Learnminal(LearnminalEvent::ChatChunk(chunk.text)),
-                        window_id,
-                    ));
-                },
-                |done| {
-                    let _ = proxy.send_event(Event::new(
-                        EventType::Learnminal(LearnminalEvent::ChatDone(done)),
-                        window_id,
-                    ));
-                },
-                |error| {
-                    let _ = proxy.send_event(Event::new(
-                        EventType::Learnminal(LearnminalEvent::SseError(error)),
-                        window_id,
-                    ));
-                },
-            );
+            let program = resolve_program(&terminal_ctx.last_command, &message);
+            let reference = reference_context(&program, DEFAULT_CONTEXT_BUDGET);
+            let journal_notes = if program.is_empty() {
+                Vec::new()
+            } else {
+                journal::recent_for_program_default(&program, 3)
+            };
+            let prompt =
+                build_chat_prompt(&terminal_ctx, Some(&reference), &journal_notes, &message);
+            let client = OllamaClient::default_client();
+            let last_command = terminal_ctx.last_command.clone();
+            let result = client.resolve_active_model().and_then(|(model, _)| {
+                client.chat_stream(
+                    &model,
+                    &prompt,
+                    |chunk| {
+                        let _ = proxy.send_event(Event::new(
+                            EventType::Learnminal(LearnminalEvent::ChatChunk {
+                                generation,
+                                text: chunk,
+                            }),
+                            window_id,
+                        ));
+                    },
+                    |done| {
+                        let verify = verify_reply(&done, &reference);
+                        let final_reply = append_footer(&done, &verify.footer);
+                        if !final_reply.trim().is_empty() {
+                            let program_key = if program.is_empty() {
+                                journal::GENERAL_PROGRAM
+                            } else {
+                                program.as_str()
+                            };
+                            let _ = journal::insert_note_default(
+                                program_key,
+                                &message,
+                                &final_reply,
+                                &last_command,
+                                reference.source.as_str(),
+                                verify.verified,
+                            );
+                        }
+                        let _ = proxy.send_event(Event::new(
+                            EventType::Learnminal(LearnminalEvent::ChatDone {
+                                generation,
+                                reply: final_reply,
+                            }),
+                            window_id,
+                        ));
+                    },
+                    |error| {
+                        let _ = proxy.send_event(Event::new(
+                            EventType::Learnminal(LearnminalEvent::SseError {
+                                generation,
+                                message: error,
+                            }),
+                            window_id,
+                        ));
+                    },
+                )
+            });
 
             if let Err(err) = result {
-                let event = match err {
-                    IpcError::BackendNotRunning => LearnminalEvent::BackendNotRunning,
-                    IpcError::Timeout => LearnminalEvent::Timeout,
-                    IpcError::IncompleteStream => LearnminalEvent::StreamIncomplete,
-                    IpcError::StreamError(message) => LearnminalEvent::SseError(message),
-                };
-                let _ =
-                    proxy.send_event(Event::new(EventType::Learnminal(event), window_id));
+                let event = learnminal_ollama_error_event(err, generation);
+                let _ = proxy.send_event(Event::new(EventType::Learnminal(event), window_id));
             }
         });
     }
@@ -2189,60 +2328,95 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::IpcConfig(_) | EventType::IpcGetConfig(..) | EventType::Shutdown => (),
                 EventType::Learnminal(event) => {
                     match event {
-                        LearnminalEvent::Chunk(text) => {
-                            self.ctx.cancel_learnminal_error_dismiss();
-                            self.ctx.display.learnminal_overlay.append_chunk(&text);
-                        },
-                        LearnminalEvent::Done(response) => {
-                            self.ctx.cancel_learnminal_error_dismiss();
-                            self.ctx.display.learnminal_overlay.finalize(&response);
-                        },
-                        LearnminalEvent::CommandReference(response) => {
-                            self.ctx.cancel_learnminal_error_dismiss();
-                            self.ctx.display.learnminal_overlay.show_command_reference(&response);
-                        },
-                        LearnminalEvent::ChatChunk(text) => {
+                        LearnminalEvent::ChatChunk { generation, text }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
                             self.ctx.cancel_learnminal_error_dismiss();
                             self.ctx.display.learnminal_overlay.append_chat_chunk(&text);
                         },
-                        LearnminalEvent::ChatDone(done) => {
+                        LearnminalEvent::ChatDone { generation, reply }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
                             self.ctx.cancel_learnminal_error_dismiss();
-                            self.ctx.display.learnminal_overlay.finalize_chat(
-                                &done.reply,
-                                &done.actionable_items,
-                            );
+                            self.ctx.display.learnminal_overlay.finalize_chat(&reply);
                         },
-                        LearnminalEvent::StreamIncomplete => {
-                            let overlay = &mut self.ctx.display.learnminal_overlay;
-                            if !overlay.try_finalize_from_stream_buffer() {
-                                overlay.show_sse_error(
-                                    "Could not parse AI response. Check the backend logs.",
-                                );
-                                self.ctx.message_buffer.push(Message::new(
-                                    "Could not parse AI response.".into(),
-                                    MessageType::Error,
-                                ));
-                                self.ctx.schedule_learnminal_error_dismiss();
-                            }
+                        LearnminalEvent::ModelsListed { generation, models, current }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
+                            self.ctx.display.learnminal_overlay.show_models(&models, &current);
                         },
-                        LearnminalEvent::SseError(message) => {
-                            self.ctx.display.learnminal_overlay.show_sse_error(&message);
+                        LearnminalEvent::ModelSelected { generation, model }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
+                            self.ctx.display.learnminal_overlay.show_model_selected(&model);
+                        },
+                        LearnminalEvent::StreamIncomplete { generation }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
+                            self.ctx
+                                .display
+                                .learnminal_overlay
+                                .show_sse_error("Chat stream ended before completion. Try again.");
                             self.ctx.message_buffer.push(Message::new(
-                                message.clone(),
+                                "Chat stream incomplete.".into(),
                                 MessageType::Error,
                             ));
                             self.ctx.schedule_learnminal_error_dismiss();
                         },
-                        LearnminalEvent::BackendNotRunning => {
+                        LearnminalEvent::SseError { generation, message }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
+                            self.ctx.display.learnminal_overlay.show_sse_error(&message);
+                            self.ctx
+                                .message_buffer
+                                .push(Message::new(message.clone(), MessageType::Error));
+                            self.ctx.schedule_learnminal_error_dismiss();
+                        },
+                        LearnminalEvent::BackendNotRunning { generation }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
                             self.ctx.display.learnminal_overlay.show_backend_not_running();
                             self.ctx.message_buffer.push(Message::new(
-                                "AI backend not running. Start with: cd ai-backend && python server_stub.py"
-                                    .into(),
+                                "Ollama not running. Start with: ollama serve".into(),
                                 MessageType::Error,
                             ));
                             self.ctx.schedule_learnminal_error_dismiss();
                         },
-                        LearnminalEvent::Timeout => {
+                        LearnminalEvent::Timeout { generation }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
                             self.ctx.display.learnminal_overlay.show_timeout();
                             self.ctx.message_buffer.push(Message::new(
                                 "Response timed out. The model may be overloaded. Try a shorter selection."
@@ -2251,13 +2425,28 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             ));
                             self.ctx.schedule_learnminal_error_dismiss();
                         },
-                        LearnminalEvent::SystemInfo(info) => {
+                        LearnminalEvent::SystemInfo { generation, info }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
                             self.ctx.display.learnminal_overlay.show_system_info(&info);
                         },
                         LearnminalEvent::DismissError => {
                             self.ctx.display.learnminal_overlay.dismiss_error();
                             self.ctx.pop_message();
                         },
+                        LearnminalEvent::ChatChunk { .. }
+                        | LearnminalEvent::ChatDone { .. }
+                        | LearnminalEvent::ModelsListed { .. }
+                        | LearnminalEvent::ModelSelected { .. }
+                        | LearnminalEvent::StreamIncomplete { .. }
+                        | LearnminalEvent::SseError { .. }
+                        | LearnminalEvent::BackendNotRunning { .. }
+                        | LearnminalEvent::Timeout { .. }
+                        | LearnminalEvent::SystemInfo { .. } => {},
                     }
                     *self.ctx.dirty = true;
                     self.ctx.display.pending_update.dirty = true;
