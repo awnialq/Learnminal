@@ -35,6 +35,8 @@ const READ_TIMEOUT_SECS: u64 = 300;
 const UNLOAD_TIMEOUT_SECS: u64 = 5;
 /// Keep the model resident until an explicit unload (`keep_alive: 0`).
 const KEEP_ALIVE_FOREVER: i64 = -1;
+/// Max non-streaming tool rounds before forcing a final streamed answer.
+const MAX_TOOL_ROUNDS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OllamaError {
@@ -126,6 +128,19 @@ impl OllamaClient {
         &self,
         model: &str,
         prompt: &str,
+        on_chunk: impl FnMut(String),
+        on_done: impl FnMut(String),
+        on_error: impl FnMut(String),
+    ) -> Result<(), OllamaError> {
+        let messages = vec![json!({ "role": "user", "content": prompt })];
+        self.chat_stream_messages(model, &messages, on_chunk, on_done, on_error)
+    }
+
+    /// Like [`chat_stream`], but with an arbitrary message history (no tools).
+    pub fn chat_stream_messages(
+        &self,
+        model: &str,
+        messages: &[Value],
         mut on_chunk: impl FnMut(String),
         mut on_done: impl FnMut(String),
         mut on_error: impl FnMut(String),
@@ -133,7 +148,7 @@ impl OllamaClient {
         let url = format!("{}/api/chat", self.base_url);
         let body = json!({
             "model": model,
-            "messages": [{ "role": "user", "content": prompt }],
+            "messages": messages,
             "stream": true,
             "keep_alive": KEEP_ALIVE_FOREVER,
         });
@@ -193,6 +208,94 @@ impl OllamaClient {
 
         on_done(reply);
         Ok(())
+    }
+
+    /// Chat with optional `web_search` tool-calling, then stream the final answer.
+    ///
+    /// Tool rounds are non-streaming (max [`MAX_TOOL_ROUNDS`]). The final turn
+    /// streams tokens via `on_chunk` / `on_done`. `on_status` reports progress
+    /// such as "Searching the web…".
+    pub fn chat_with_tools_loop(
+        &self,
+        model: &str,
+        prompt: &str,
+        enable_web_search: bool,
+        mut on_status: impl FnMut(&str),
+        mut on_chunk: impl FnMut(String),
+        mut on_done: impl FnMut(String),
+        mut on_error: impl FnMut(String),
+    ) -> Result<(), OllamaError> {
+        if !enable_web_search {
+            return self.chat_stream(model, prompt, on_chunk, on_done, on_error);
+        }
+
+        let mut messages = vec![json!({ "role": "user", "content": prompt })];
+        let tools = vec![web_search_tool_schema()];
+
+        for _round in 0..MAX_TOOL_ROUNDS {
+            let response = self.chat_once(model, &messages, Some(&tools))?;
+            if let Some(error) = response.get("error").and_then(Value::as_str) {
+                on_error(error.to_owned());
+                return Ok(());
+            }
+
+            let message = response.get("message").cloned().unwrap_or(json!({}));
+            let tool_calls = extract_tool_calls(&message);
+            if tool_calls.is_empty() {
+                let content = message_content(&message);
+                if content.is_empty() {
+                    // Nothing useful — fall through to a streaming retry without tools.
+                    break;
+                }
+                on_chunk(content.clone());
+                on_done(content);
+                return Ok(());
+            }
+
+            // Keep the assistant tool-call turn in history.
+            messages.push(message);
+
+            for call in tool_calls {
+                if call.name != "web_search" {
+                    messages.push(json!({
+                        "role": "tool",
+                        "content": format!("unknown tool: {}", call.name),
+                    }));
+                    continue;
+                }
+                on_status("Searching the web…");
+                let query = call.query.unwrap_or_default();
+                let result = crate::learnminal::web_search::search_tool_result(&query);
+                messages.push(json!({
+                    "role": "tool",
+                    "content": result,
+                }));
+            }
+        }
+
+        // Final streamed answer without tools.
+        self.chat_stream_messages(model, &messages, on_chunk, on_done, on_error)
+    }
+
+    /// Non-streaming `/api/chat` round (optional tools).
+    fn chat_once(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+    ) -> Result<Value, OllamaError> {
+        let url = format!("{}/api/chat", self.base_url);
+        let mut body = json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+            "keep_alive": KEEP_ALIVE_FOREVER,
+        });
+        if let Some(tools) = tools {
+            body["tools"] = Value::Array(tools.to_vec());
+        }
+        let response = self.send(self.client.post(&url).json(&body))?;
+        response.json().map_err(|err| OllamaError::StreamError(err.to_string()))
     }
 
     /// Load a model into memory and keep it resident until explicitly unloaded.
@@ -323,6 +426,88 @@ pub fn pick_available(candidates: &[Option<String>], installed: &[String]) -> Op
         }
     }
     installed.first().cloned()
+}
+
+fn web_search_tool_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the live web for up-to-date facts, versions, changelogs, or docs not present in the local Reference.",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query string"
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedToolCall {
+    name: String,
+    query: Option<String>,
+}
+
+fn message_content(message: &Value) -> String {
+    message.get("content").and_then(Value::as_str).unwrap_or("").to_owned()
+}
+
+/// Parse Ollama `message.tool_calls` defensively (arguments may be object or JSON string).
+fn extract_tool_calls(message: &Value) -> Vec<ParsedToolCall> {
+    let Some(Value::Array(calls)) = message.get("tool_calls") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for call in calls {
+        let function = call.get("function").unwrap_or(call);
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let query = tool_query_arg(function.get("arguments"));
+        out.push(ParsedToolCall { name, query });
+    }
+    out
+}
+
+fn tool_query_arg(arguments: Option<&Value>) -> Option<String> {
+    let Some(arguments) = arguments else {
+        return None;
+    };
+    match arguments {
+        Value::Object(map) => map
+            .get("query")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
+                return map
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
+            }
+            // Bare query string.
+            Some(trimmed.to_owned())
+        },
+        _ => None,
+    }
 }
 
 fn map_reqwest_error(err: reqwest::Error) -> OllamaError {
@@ -542,5 +727,96 @@ mod tests {
             assert!(names.contains(&DEFAULT_MODEL));
             assert!(!names.contains(&DEFAULT_MODEL_MLX));
         }
+    }
+
+    #[test]
+    fn extract_tool_calls_parses_object_and_string_arguments() {
+        let message = json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "web_search",
+                        "arguments": { "query": "git rebase" }
+                    }
+                },
+                {
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"rust edition 2024\"}"
+                    }
+                }
+            ]
+        });
+        let calls = extract_tool_calls(&message);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].query.as_deref(), Some("git rebase"));
+        assert_eq!(calls[1].query.as_deref(), Some("rust edition 2024"));
+    }
+
+    #[test]
+    fn tools_loop_streams_when_model_skips_tools() {
+        let mut server = start_server();
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::PartialJson(json!({
+                "model": "m",
+                "stream": false,
+            })))
+            .with_status(200)
+            .with_body(r#"{"message":{"role":"assistant","content":"no search needed"},"done":true}"#)
+            .create();
+
+        let client = OllamaClient::new(&server.url());
+        let chunks = RefCell::new(Vec::new());
+        let mut reply = None;
+        let statuses = RefCell::new(Vec::new());
+
+        client
+            .chat_with_tools_loop(
+                "m",
+                "hi",
+                true,
+                |s| statuses.borrow_mut().push(s.to_owned()),
+                |c| chunks.borrow_mut().push(c),
+                |r| reply = Some(r),
+                |_| panic!("unexpected error"),
+            )
+            .unwrap();
+
+        assert!(statuses.borrow().is_empty());
+        assert_eq!(*chunks.borrow(), vec!["no search needed"]);
+        assert_eq!(reply.as_deref(), Some("no search needed"));
+    }
+
+    #[test]
+    fn tools_loop_disabled_uses_plain_stream() {
+        let mut server = start_server();
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::PartialJson(json!({
+                "model": "m",
+                "stream": true,
+            })))
+            .with_status(200)
+            .with_body(ndjson_chat_body(&["ok"]))
+            .create();
+
+        let client = OllamaClient::new(&server.url());
+        let mut reply = None;
+        client
+            .chat_with_tools_loop(
+                "m",
+                "hi",
+                false,
+                |_| panic!("status should not fire"),
+                |_| {},
+                |r| reply = Some(r),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(reply.as_deref(), Some("ok"));
     }
 }

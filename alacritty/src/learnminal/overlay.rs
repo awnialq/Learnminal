@@ -385,6 +385,20 @@ impl OverlayPanel {
         self.needs_redraw = true;
     }
 
+    /// Replace the transient loading line with a status message (e.g. web search).
+    pub fn set_status(&mut self, message: &str) {
+        self.remove_loading_lines();
+        let lines = self.view_lines_mut();
+        lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
+        lines.push(DisplayLine {
+            text: format!("  ◐  {message}"),
+            style: LineStyle::Muted,
+        });
+        lines.push(DisplayLine { text: String::new(), style: LineStyle::Body });
+        self.stick_to_bottom = true;
+        self.needs_redraw = true;
+    }
+
     pub fn flush_pending(&mut self) {
         if self.pending_redraw {
             self.pending_redraw = false;

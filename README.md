@@ -29,6 +29,8 @@ ollama serve
 
 Then press `Ctrl+Shift+E` in Learnminal to open Chat and ask a question about your terminal. Opening Chat preloads the active model so the first response starts faster. The app talks directly to Ollama; no Python sidecar is required. When you submit a chat question, Learnminal may include a concise `man`/`--help` excerpt for the last command as hidden context.
 
+The model can call a `web_search` tool (DuckDuckGo) when it needs up-to-date information. Disable with `LEARNMINAL_WEB_SEARCH=0`.
+
 Slash commands in the overlay:
 
 - `/model list` — show installed Ollama models

@@ -612,6 +612,11 @@ pub enum LearnminalEvent {
     StreamIncomplete {
         generation: u64,
     },
+    /// Progress status while tools run (e.g. web search).
+    Status {
+        generation: u64,
+        message: String,
+    },
     SseError {
         generation: u64,
         message: String,
@@ -1838,10 +1843,21 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 build_chat_prompt(&terminal_ctx, Some(&reference), &journal_notes, &message);
             let client = OllamaClient::default_client();
             let last_command = terminal_ctx.last_command.clone();
+            let enable_web_search = crate::learnminal::web_search::web_search_enabled();
             let result = client.resolve_active_model().and_then(|(model, _)| {
-                client.chat_stream(
+                client.chat_with_tools_loop(
                     &model,
                     &prompt,
+                    enable_web_search,
+                    |status| {
+                        let _ = proxy.send_event(Event::new(
+                            EventType::Learnminal(LearnminalEvent::Status {
+                                generation,
+                                message: status.to_owned(),
+                            }),
+                            window_id,
+                        ));
+                    },
                     |chunk| {
                         let _ = proxy.send_event(Event::new(
                             EventType::Learnminal(LearnminalEvent::ChatChunk {
@@ -2338,6 +2354,16 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             self.ctx.cancel_learnminal_error_dismiss();
                             self.ctx.display.learnminal_overlay.append_chat_chunk(&text);
                         },
+                        LearnminalEvent::Status { generation, message }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
+                            self.ctx.cancel_learnminal_error_dismiss();
+                            self.ctx.display.learnminal_overlay.set_status(&message);
+                        },
                         LearnminalEvent::ChatDone { generation, reply }
                             if !self
                                 .ctx
@@ -2440,6 +2466,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         },
                         LearnminalEvent::ChatChunk { .. }
                         | LearnminalEvent::ChatDone { .. }
+                        | LearnminalEvent::Status { .. }
                         | LearnminalEvent::ModelsListed { .. }
                         | LearnminalEvent::ModelSelected { .. }
                         | LearnminalEvent::StreamIncomplete { .. }
