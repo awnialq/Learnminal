@@ -25,7 +25,10 @@ pub fn build_chat_prompt(
          Answer in clear conversational plain text. Do not use markdown.\n\
          Prefer the Reference and Past notes sections over remembered training data.\n\
          Do not invent flags or options that are not present in the Reference.\n\
-         If Reference is missing, say so rather than guessing flags.\n\n",
+         If Reference is missing, say so rather than guessing flags.\n\
+         You may call the web_search tool for current events, version changes, changelogs,\n\
+         or facts not covered by Reference. Prefer local Reference for flags and options.\n\
+         When using search results, briefly cite titles or URLs in plain text.\n\n",
     );
 
     if let Some(env) = env_line() {
@@ -164,6 +167,7 @@ mod tests {
         assert!(prompt.contains("Output:\nerror: failed to push"));
         assert!(prompt.contains("User question:\nwhy did this fail?"));
         assert!(prompt.contains("Prefer the Reference and Past notes"));
+        assert!(prompt.contains("web_search"));
     }
 
     #[test]

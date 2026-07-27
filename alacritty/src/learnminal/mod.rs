@@ -11,6 +11,7 @@ pub mod settings;
 pub mod sysinfo;
 pub mod types;
 pub mod verify;
+pub mod web_search;
 
 pub use grid_extractor::{extract_context, read_last_exit_code};
 pub use ollama::{OllamaClient, OllamaError};

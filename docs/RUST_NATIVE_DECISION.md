@@ -12,7 +12,10 @@ sidecar, local HTTP API, or IPC contract is required.
    send an automatic question or summarize a manual.
 3. Submit a question. Learnminal gathers terminal context and can add a concise
    `man`/`--help` excerpt for the last command as hidden context.
-4. The Rust client streams Ollama NDJSON responses directly into the overlay.
+4. If web search is enabled (default), the model may call a `web_search` tool
+   backed by DuckDuckGo (max two tool rounds). Set `LEARNMINAL_WEB_SEARCH=0` to
+   disable. Flag verification still uses local Reference only.
+5. The Rust client streams the final Ollama NDJSON answer into the overlay.
 
 `/model` lists or selects installed Ollama models. The selected model is stored
 in `~/.ai-cli-learning/settings.json`; the selection order is persisted model,
