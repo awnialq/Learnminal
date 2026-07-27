@@ -77,9 +77,9 @@ mod tests {
     #[test]
     fn round_trips_preferred_model() {
         let dir = tempfile::tempdir().unwrap();
-        write_preferred_model(dir.path(), "qwen3.6:35b-a3b").unwrap();
+        write_preferred_model(dir.path(), "gemma4:e4b-mlx").unwrap();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        assert_eq!(read_preferred_model(&path).as_deref(), Some("qwen3.6:35b-a3b"));
+        assert_eq!(read_preferred_model(&path).as_deref(), Some("gemma4:e4b-mlx"));
     }
 
     #[test]

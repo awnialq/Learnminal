@@ -15,7 +15,19 @@ use serde_json::{json, Value};
 use crate::learnminal::settings;
 
 /// Built-in default model when nothing else is configured/installed.
-pub const DEFAULT_MODEL: &str = "qwen3.6:35b-a3b";
+pub const DEFAULT_MODEL: &str = "gemma4:e4b";
+
+/// macOS MLX-optimized variant of [`DEFAULT_MODEL`].
+pub const DEFAULT_MODEL_MLX: &str = "gemma4:e4b-mlx";
+
+/// Platform default: MLX tag on macOS, standard tag elsewhere.
+pub fn default_model() -> &'static str {
+    if cfg!(target_os = "macos") {
+        DEFAULT_MODEL_MLX
+    } else {
+        DEFAULT_MODEL
+    }
+}
 
 const DEFAULT_HOST: &str = "http://127.0.0.1:11434";
 const CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -217,13 +229,18 @@ impl OllamaClient {
 
     /// Resolve the active model, returning `(active, installed)`.
     ///
-    /// Preference order: settings → `LEARNMINAL_OLLAMA_MODEL` → built-in
-    /// default → first installed.
+    /// Preference order: settings → `LEARNMINAL_OLLAMA_MODEL` → platform
+    /// default (`gemma4:e4b-mlx` on macOS, `gemma4:e4b` elsewhere) → first
+    /// installed. On macOS the non-MLX tag is also tried as a fallback.
     pub fn resolve_active_model(&self) -> Result<(String, Vec<String>), OllamaError> {
         let installed = self.list_models()?;
         let candidates = candidate_models();
         let active = pick_available(&candidates, &installed).unwrap_or_else(|| {
-            candidates.into_iter().flatten().next().unwrap_or_else(|| DEFAULT_MODEL.to_owned())
+            candidates
+                .into_iter()
+                .flatten()
+                .next()
+                .unwrap_or_else(|| default_model().to_owned())
         });
         Ok((active, installed))
     }
@@ -273,12 +290,19 @@ impl OllamaClient {
 }
 
 /// Candidate models in preference order (some may be `None`).
+///
+/// On macOS the MLX default is preferred, with the non-MLX tag as a fallback
+/// so a stock pull of `gemma4:e4b` still resolves when the `-mlx` tag is absent.
 fn candidate_models() -> Vec<Option<String>> {
-    vec![
+    let mut candidates = vec![
         settings::get_preferred_model(),
         std::env::var("LEARNMINAL_OLLAMA_MODEL").ok().filter(|s| !s.trim().is_empty()),
-        Some(DEFAULT_MODEL.to_owned()),
-    ]
+        Some(default_model().to_owned()),
+    ];
+    if cfg!(target_os = "macos") && default_model() != DEFAULT_MODEL {
+        candidates.push(Some(DEFAULT_MODEL.to_owned()));
+    }
+    candidates
 }
 
 /// Port of `_pick_available`: exact match, then base-name (`before ':'`) match,
@@ -472,7 +496,7 @@ mod tests {
 
     #[test]
     fn pick_available_exact_then_base_then_first() {
-        let installed = vec!["qwen3:8b".to_owned(), "llama3:latest".to_owned()];
+        let installed = vec!["gemma4:e4b".to_owned(), "llama3:latest".to_owned()];
         // Exact match.
         assert_eq!(
             pick_available(&[Some("llama3:latest".into())], &installed),
@@ -480,15 +504,43 @@ mod tests {
         );
         // Base-name match (different tag).
         assert_eq!(
-            pick_available(&[Some("qwen3:14b".into())], &installed),
-            Some("qwen3:8b".to_owned())
+            pick_available(&[Some("gemma4:27b".into())], &installed),
+            Some("gemma4:e4b".to_owned())
         );
         // No match falls back to first installed.
         assert_eq!(
             pick_available(&[Some("nope:1".into())], &installed),
-            Some("qwen3:8b".to_owned())
+            Some("gemma4:e4b".to_owned())
         );
         // Empty installed yields None.
         assert_eq!(pick_available(&[Some("x".into())], &[]), None);
+    }
+
+    #[test]
+    fn default_model_is_platform_specific() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(default_model(), DEFAULT_MODEL_MLX);
+            assert_eq!(default_model(), "gemma4:e4b-mlx");
+        } else {
+            assert_eq!(default_model(), DEFAULT_MODEL);
+            assert_eq!(default_model(), "gemma4:e4b");
+        }
+    }
+
+    #[test]
+    fn macos_candidates_prefer_mlx_then_stock() {
+        let candidates = candidate_models();
+        let names: Vec<&str> =
+            candidates.iter().flatten().map(String::as_str).collect();
+        if cfg!(target_os = "macos") {
+            assert!(names.contains(&DEFAULT_MODEL_MLX));
+            assert!(names.contains(&DEFAULT_MODEL));
+            let mlx = names.iter().position(|n| *n == DEFAULT_MODEL_MLX).expect("mlx");
+            let stock = names.iter().position(|n| *n == DEFAULT_MODEL).expect("stock");
+            assert!(mlx < stock, "MLX default should precede stock fallback");
+        } else {
+            assert!(names.contains(&DEFAULT_MODEL));
+            assert!(!names.contains(&DEFAULT_MODEL_MLX));
+        }
     }
 }

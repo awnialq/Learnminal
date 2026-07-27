@@ -35,4 +35,5 @@ Slash commands in the overlay:
 - `/model <name>` — switch the active model
 - `/info` — show cached system environment
 
-Optional: set a default model with `LEARNMINAL_OLLAMA_MODEL` or persist a choice via `/model`.
+Default model: `gemma4:e4b-mlx` on macOS, `gemma4:e4b` elsewhere. Override with
+`LEARNMINAL_OLLAMA_MODEL` or persist a choice via `/model`.

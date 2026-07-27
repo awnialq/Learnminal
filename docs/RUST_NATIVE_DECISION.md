@@ -16,8 +16,9 @@ sidecar, local HTTP API, or IPC contract is required.
 
 `/model` lists or selects installed Ollama models. The selected model is stored
 in `~/.ai-cli-learning/settings.json`; the selection order is persisted model,
-`LEARNMINAL_OLLAMA_MODEL`, the built-in default, then the first installed
-model. `/info` reports locally collected system information.
+`LEARNMINAL_OLLAMA_MODEL`, the platform default (`gemma4:e4b-mlx` on macOS,
+`gemma4:e4b` elsewhere — with the non-MLX tag as a macOS fallback), then the
+first installed model. `/info` reports locally collected system information.
 
 Closing or replacing a chat request invalidates stale stream events and asks
 Ollama to unload the active model. Chat replies are displayed as plain text;
