@@ -61,6 +61,7 @@ use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::learnminal::journal;
 use crate::learnminal::manpage::{reference_context, DEFAULT_CONTEXT_BUDGET};
 use crate::learnminal::prompt::build_chat_prompt;
+use crate::learnminal::settings::{self, ExperienceLevel};
 use crate::learnminal::sysinfo;
 use crate::learnminal::types::resolve_program;
 use crate::learnminal::verify::{append_footer, verify_reply};
@@ -1078,6 +1079,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 self.display.learnminal_overlay.begin_slash_command("/journal");
                 self.run_learnminal_journal(program, clear);
             },
+            SlashCommand::Level { level, list } => {
+                info!("Learnminal: /level slash command");
+                self.display.learnminal_overlay.begin_slash_command("/level");
+                self.run_learnminal_level(level, list);
+            },
             SlashCommand::Help | SlashCommand::Clear => {},
         }
         self.request_redraw();
@@ -1826,6 +1832,22 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         }
     }
 
+    fn run_learnminal_level(&mut self, level: Option<ExperienceLevel>, list: bool) {
+        match level {
+            Some(level) if !list => match settings::set_experience_level(level) {
+                Ok(()) => self.display.learnminal_overlay.show_experience_level_selected(level),
+                Err(err) => self.display.learnminal_overlay.show_slash_message(
+                    "Experience level",
+                    &[format!("Could not save experience level: {err}")],
+                ),
+            },
+            _ => {
+                let current = settings::get_experience_level();
+                self.display.learnminal_overlay.show_experience_levels(current);
+            },
+        }
+    }
+
     fn spawn_learnminal_chat(&self, terminal_ctx: TerminalContext, message: String) {
         let proxy = self.event_proxy.clone();
         let window_id = self.display.window.id();
@@ -1839,8 +1861,14 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             } else {
                 journal::recent_for_program_default(&program, 3)
             };
-            let prompt =
-                build_chat_prompt(&terminal_ctx, Some(&reference), &journal_notes, &message);
+            let experience_level = settings::get_experience_level();
+            let prompt = build_chat_prompt(
+                &terminal_ctx,
+                Some(&reference),
+                &journal_notes,
+                &message,
+                experience_level,
+            );
             let client = OllamaClient::default_client();
             let last_command = terminal_ctx.last_command.clone();
             let enable_web_search = crate::learnminal::web_search::web_search_enabled();

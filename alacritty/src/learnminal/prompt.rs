@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use crate::learnminal::journal::JournalNote;
+use crate::learnminal::settings::ExperienceLevel;
 use crate::learnminal::types::{ReferenceContext, TerminalContext};
 
 const CONTEXT_MAX_CHARS: usize = 1_000;
@@ -18,18 +19,11 @@ pub fn build_chat_prompt(
     reference: Option<&ReferenceContext>,
     journal_notes: &[JournalNote],
     message: &str,
+    experience_level: ExperienceLevel,
 ) -> String {
     let mut prompt = String::new();
-    prompt.push_str(
-        "You are an expert command-line educator helping a developer understand their shell.\n\
-         Answer in clear conversational plain text. Do not use markdown.\n\
-         Prefer the Reference and Past notes sections over remembered training data.\n\
-         Do not invent flags or options that are not present in the Reference.\n\
-         If Reference is missing, say so rather than guessing flags.\n\
-         You may call the web_search tool for current events, version changes, changelogs,\n\
-         or facts not covered by Reference. Prefer local Reference for flags and options.\n\
-         When using search results, briefly cite titles or URLs in plain text.\n\n",
-    );
+    prompt.push_str(&system_instructions(experience_level));
+    prompt.push_str("\n\n");
 
     if let Some(env) = env_line() {
         prompt.push_str(&env);
@@ -78,6 +72,52 @@ pub fn build_chat_prompt(
     prompt.push_str("User question:\n");
     prompt.push_str(message.trim());
     prompt
+}
+
+fn system_instructions(level: ExperienceLevel) -> String {
+    let mut instructions = String::from(
+        "You are an expert command-line educator helping a developer understand their shell.\n\
+         Answer in clear conversational plain text. Do not use markdown.\n\
+         Prefer the Reference and Past notes sections over remembered training data.\n\
+         Do not invent flags or options that are not present in the Reference.\n\
+         If Reference is missing, say so rather than guessing flags.\n\
+         You may call the web_search tool for current events, version changes, changelogs,\n\
+         or facts not covered by Reference. Prefer local Reference for flags and options.\n\
+         When using search results, briefly cite titles or URLs in plain text.\n",
+    );
+    instructions.push_str(&experience_guidance(level));
+    instructions
+}
+
+fn experience_guidance(level: ExperienceLevel) -> String {
+    match level {
+        ExperienceLevel::Beginner => {
+            "User experience level: Beginner.\n\
+             Assume little or no terminal experience. Define terminology in plain language,\n\
+             explain what each command and flag does step by step, avoid jargon unless you\n\
+             briefly explain it, and include safe next actions the user can try.\n"
+                .into()
+        },
+        ExperienceLevel::Novice => {
+            "User experience level: Novice.\n\
+             The user has some shell experience. Keep explanations approachable but lighter\n\
+             than for beginners. Focus on non-obvious flags, common failure modes, and why\n\
+             a command behaves the way it does without over-explaining basics.\n"
+                .into()
+        },
+        ExperienceLevel::Professional => {
+            "User experience level: Professional.\n\
+             The user is a comfortable daily CLI user. Be concise. Focus on root cause,\n\
+             tradeoffs, exact commands, and useful references. Skip elementary shell concepts.\n"
+                .into()
+        },
+        ExperienceLevel::Expert => {
+            "User experience level: Expert.\n\
+             The user has deep terminal knowledge. Be terse and precise. Avoid basics.\n\
+             Emphasize edge cases, internals, and high-signal diagnostics.\n"
+                .into()
+        },
+    }
 }
 
 fn format_journal_notes(notes: &[JournalNote]) -> Option<String> {
@@ -161,7 +201,8 @@ mod tests {
 
     #[test]
     fn prompt_includes_command_output_and_question() {
-        let prompt = build_chat_prompt(&ctx(), None, &[], "why did this fail?");
+        let prompt =
+            build_chat_prompt(&ctx(), None, &[], "why did this fail?", ExperienceLevel::Beginner);
         assert!(prompt.contains("Last command:\ngit push origin main"));
         assert!(prompt.contains("Exit code: 1"));
         assert!(prompt.contains("Output:\nerror: failed to push"));
@@ -177,7 +218,8 @@ mod tests {
             source: ReferenceSource::Man,
             body: "NAME\n git - tracker".into(),
         };
-        let prompt = build_chat_prompt(&ctx(), Some(&reference), &[], "explain");
+        let prompt =
+            build_chat_prompt(&ctx(), Some(&reference), &[], "explain", ExperienceLevel::Novice);
         assert!(prompt.contains("Reference (man):"));
         assert!(prompt.contains("git - tracker"));
     }
@@ -185,7 +227,8 @@ mod tests {
     #[test]
     fn prompt_includes_missing_reference_notice() {
         let reference = ReferenceContext::empty("obscuretool");
-        let prompt = build_chat_prompt(&ctx(), Some(&reference), &[], "help");
+        let prompt =
+            build_chat_prompt(&ctx(), Some(&reference), &[], "help", ExperienceLevel::Beginner);
         assert!(prompt.contains("No local man/--help"));
         assert!(prompt.contains("obscuretool"));
     }
@@ -202,7 +245,8 @@ mod tests {
             verified: Some(true),
             created_at: 1,
         }];
-        let prompt = build_chat_prompt(&ctx(), None, &notes, "again?");
+        let prompt =
+            build_chat_prompt(&ctx(), None, &notes, "again?", ExperienceLevel::Professional);
         assert!(prompt.contains("Past notes for git:"));
         assert!(prompt.contains("how do I rebase?"));
         assert!(prompt.contains("Use git rebase -i"));
@@ -212,8 +256,23 @@ mod tests {
     fn prompt_omits_zero_exit_code() {
         let mut c = ctx();
         c.exit_code = Some(0);
-        let prompt = build_chat_prompt(&c, None, &[], "q");
+        let prompt = build_chat_prompt(&c, None, &[], "q", ExperienceLevel::Beginner);
         assert!(!prompt.contains("Exit code:"));
+    }
+
+    #[test]
+    fn prompt_includes_beginner_guidance() {
+        let prompt = build_chat_prompt(&ctx(), None, &[], "q", ExperienceLevel::Beginner);
+        assert!(prompt.contains("User experience level: Beginner."));
+        assert!(prompt.contains("step by step"));
+    }
+
+    #[test]
+    fn prompt_includes_expert_guidance() {
+        let prompt = build_chat_prompt(&ctx(), None, &[], "q", ExperienceLevel::Expert);
+        assert!(prompt.contains("User experience level: Expert."));
+        assert!(prompt.contains("terse and precise"));
+        assert!(!prompt.contains("step by step"));
     }
 
     #[test]

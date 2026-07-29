@@ -35,7 +35,12 @@ Slash commands in the overlay:
 
 - `/model list` — show installed Ollama models
 - `/model <name>` — switch the active model
+- `/level` — show experience levels
+- `/level <beginner|novice|professional|expert>` — set experience level for explanations
 - `/info` — show cached system environment
 
 Default model: `gemma4:e4b-mlx` on macOS, `gemma4:e4b` elsewhere. Override with
 `LEARNMINAL_OLLAMA_MODEL` or persist a choice via `/model`.
+
+Default experience level is `beginner`. Persist a choice via `/level` in
+`~/.ai-cli-learning/settings.json`.

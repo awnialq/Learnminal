@@ -21,7 +21,10 @@ sidecar, local HTTP API, or IPC contract is required.
 in `~/.ai-cli-learning/settings.json`; the selection order is persisted model,
 `LEARNMINAL_OLLAMA_MODEL`, the platform default (`gemma4:e4b-mlx` on macOS,
 `gemma4:e4b` elsewhere — with the non-MLX tag as a macOS fallback), then the
-first installed model. `/info` reports locally collected system information.
+first installed model. `/level` sets the user experience tier
+(`beginner`/`novice`/`professional`/`expert`, default `beginner`) in the same
+settings file so chat explanations match terminal knowledge. `/info` reports
+locally collected system information.
 
 Closing or replacing a chat request invalidates stale stream events and asks
 Ollama to unload the active model. Chat replies are displayed as plain text;

@@ -10,6 +10,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::config::UiConfig;
 use crate::display::color::Rgb;
 use crate::display::SizeInfo;
+use crate::learnminal::settings::ExperienceLevel;
 use crate::learnminal::types::SystemInfo;
 use crate::renderer::rects::RenderRect;
 
@@ -42,6 +43,8 @@ pub enum SlashCommand {
     Model { name: Option<String>, list: bool },
     /// Browse or clear the local command journal.
     Journal { program: Option<String>, clear: bool },
+    /// List or switch the user experience level.
+    Level { level: Option<ExperienceLevel>, list: bool },
     /// List available slash commands (handled locally).
     Help,
     /// Clear the Chat mode transcript (handled locally).
@@ -84,6 +87,28 @@ impl SlashCommand {
                     ));
                 }
                 Some(Ok(Self::Journal { program, clear }))
+            },
+            "level" => {
+                let mut args: Vec<&str> = words.collect();
+                let list = args.first().is_some_and(|w| w.eq_ignore_ascii_case("list"));
+                if list {
+                    args.remove(0);
+                }
+                let level_arg = args.first().copied();
+                if list && level_arg.is_some() {
+                    return Some(Err(
+                        "Usage: /level [list|beginner|novice|professional|expert]".into(),
+                    ));
+                }
+                match level_arg {
+                    None => Some(Ok(Self::Level { level: None, list: true })),
+                    Some(raw) => match raw.parse::<ExperienceLevel>() {
+                        Ok(level) => Some(Ok(Self::Level { level: Some(level), list: false })),
+                        Err(()) => Some(Err(format!(
+                            "Unknown level '{raw}'. Use beginner, novice, professional, or expert."
+                        ))),
+                    },
+                }
             },
             "help" => Some(Ok(Self::Help)),
             "clear" => Some(Ok(Self::Clear)),
@@ -546,6 +571,8 @@ impl OverlayPanel {
                 "/info refresh — re-scan system environment".into(),
                 "/model list — show installed Ollama models".into(),
                 "/model <name> — switch active model".into(),
+                "/level — show experience levels".into(),
+                "/level <beginner|novice|professional|expert> — set experience level".into(),
                 "/journal — list programs with saved notes".into(),
                 "/journal <program> — show recent notes for a program".into(),
                 "/journal clear <program> — delete notes for a program".into(),
@@ -630,6 +657,35 @@ impl OverlayPanel {
             &[
                 format!("Active model is now: {model}"),
                 "Future chat replies will use this model.".into(),
+            ],
+        );
+    }
+
+    /// Display experience levels and the active tier.
+    pub fn show_experience_levels(&mut self, current: ExperienceLevel) {
+        let mut lines = vec![format!("Active level: {}", current.label())];
+        lines.push("Available levels:".into());
+        for level in ExperienceLevel::ALL {
+            let marker = if level == current { " (active)" } else { "" };
+            lines.push(format!(
+                "  {} — {}{marker}",
+                level.as_str(),
+                level.description()
+            ));
+        }
+        lines.push("".into());
+        lines.push("Switch with: /level <beginner|novice|professional|expert>".into());
+        self.show_slash_message("Experience level", &lines);
+    }
+
+    /// Confirm an experience level switch.
+    pub fn show_experience_level_selected(&mut self, level: ExperienceLevel) {
+        self.show_slash_message(
+            "Experience level updated",
+            &[
+                format!("Active level is now: {}", level.label()),
+                format!("({}.)", level.description()),
+                "Future chat replies will match this experience level.".into(),
             ],
         );
     }
@@ -774,6 +830,7 @@ impl OverlayPanel {
                         Ok(cmd @ SlashCommand::Journal { .. }) => {
                             OverlayAction::RunSlashCommand(cmd)
                         },
+                        Ok(cmd @ SlashCommand::Level { .. }) => OverlayAction::RunSlashCommand(cmd),
                         Err(message) => {
                             self.show_slash_message("Command error", &[message]);
                             OverlayAction::None
@@ -1694,6 +1751,28 @@ mod tests {
     #[test]
     fn slash_command_parse_clear() {
         assert_eq!(SlashCommand::parse("/clear").unwrap().unwrap(), SlashCommand::Clear);
+    }
+
+    #[test]
+    fn slash_command_parse_level() {
+        assert_eq!(
+            SlashCommand::parse("/level").unwrap().unwrap(),
+            SlashCommand::Level { level: None, list: true }
+        );
+        assert_eq!(
+            SlashCommand::parse("/level list").unwrap().unwrap(),
+            SlashCommand::Level { level: None, list: true }
+        );
+        assert_eq!(
+            SlashCommand::parse("/level beginner").unwrap().unwrap(),
+            SlashCommand::Level { level: Some(ExperienceLevel::Beginner), list: false }
+        );
+        assert_eq!(
+            SlashCommand::parse("/level Professional").unwrap().unwrap(),
+            SlashCommand::Level { level: Some(ExperienceLevel::Professional), list: false }
+        );
+        assert!(SlashCommand::parse("/level wizard").unwrap().is_err());
+        assert!(SlashCommand::parse("/level list beginner").unwrap().is_err());
     }
 
     #[test]
