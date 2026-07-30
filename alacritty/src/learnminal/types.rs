@@ -10,6 +10,14 @@ pub struct TerminalContext {
     /// Empty when the output has scrolled off screen or no command was detected.
     #[serde(default)]
     pub last_command_output: String,
+    /// Recent commands from this terminal session, oldest first. The final entry is
+    /// the same command as [`Self::last_command`]. Empty when nothing was recovered.
+    #[serde(default)]
+    pub command_history: Vec<CommandEntry>,
+    /// Where [`Self::command_history`] came from, which determines how much of it
+    /// can be trusted (grid-only history has no exit codes).
+    #[serde(default)]
+    pub history_source: HistorySource,
     pub cwd: String,
     pub exit_code: Option<i32>,
     pub rows: u16,
@@ -23,12 +31,43 @@ impl Default for TerminalContext {
             selected_text: None,
             last_command: String::new(),
             last_command_output: String::new(),
+            command_history: Vec::new(),
+            history_source: HistorySource::None,
             cwd: String::new(),
             exit_code: None,
             rows: 0,
             cols: 0,
         }
     }
+}
+
+/// One command from the session history, as shown to the model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandEntry {
+    pub command: String,
+    /// `None` when the exit code could not be recovered (grid-only history).
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// Output recovered from the terminal grid. Empty when the command's output was
+    /// cleared, scrolled away, or never matched to a grid block.
+    #[serde(default)]
+    pub output: String,
+    /// Working directory the command ran in. Empty on the grid-only path.
+    #[serde(default)]
+    pub cwd: String,
+}
+
+/// Provenance of [`TerminalContext::command_history`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySource {
+    /// No history could be recovered.
+    #[default]
+    None,
+    /// Reconstructed from the terminal grid alone; exit codes are unavailable.
+    GridOnly,
+    /// Joined with records written by the shell integration hook; exit codes exact.
+    ShellHook,
 }
 
 /// System environment snapshot for the overlay `/info` command.
@@ -217,33 +256,74 @@ mod tests {
         assert!(resolve_program("", "how do I fix this error?").is_empty());
     }
 
+    #[test]
+    fn terminal_context_deserializes_legacy_json_without_history() {
+        // Contexts serialized before command history existed must still load.
+        let legacy = r#"{
+            "visible_text": "hello",
+            "selected_text": null,
+            "last_command": "ls",
+            "cwd": "/tmp",
+            "exit_code": 0,
+            "rows": 24,
+            "cols": 80
+        }"#;
+        let ctx: TerminalContext = serde_json::from_str(legacy).unwrap();
+        assert_eq!(ctx.last_command, "ls");
+        assert!(ctx.command_history.is_empty());
+        assert_eq!(ctx.history_source, HistorySource::None);
+        assert!(ctx.last_command_output.is_empty());
+    }
+
+    fn arb_command_entry() -> impl Strategy<Value = CommandEntry> {
+        (".*", prop::option::of(any::<i32>()), ".*", ".*").prop_map(
+            |(command, exit_code, output, cwd)| CommandEntry { command, exit_code, output, cwd },
+        )
+    }
+
+    fn arb_history_source() -> impl Strategy<Value = HistorySource> {
+        prop_oneof![
+            Just(HistorySource::None),
+            Just(HistorySource::GridOnly),
+            Just(HistorySource::ShellHook),
+        ]
+    }
+
     fn arb_terminal_context() -> impl Strategy<Value = TerminalContext> {
         (
-            ".*",
-            prop::option::of(".*"),
-            ".*",
-            ".*",
-            ".*",
-            prop::option::of(any::<i32>()),
-            any::<u16>(),
-            any::<u16>(),
+            (
+                ".*",
+                prop::option::of(".*"),
+                ".*",
+                ".*",
+                ".*",
+                prop::option::of(any::<i32>()),
+                any::<u16>(),
+                any::<u16>(),
+            ),
+            (prop::collection::vec(arb_command_entry(), 0..4), arb_history_source()),
         )
             .prop_map(
                 |(
-                    visible_text,
-                    selected_text,
-                    last_command,
-                    last_command_output,
-                    cwd,
-                    exit_code,
-                    rows,
-                    cols,
+                    (
+                        visible_text,
+                        selected_text,
+                        last_command,
+                        last_command_output,
+                        cwd,
+                        exit_code,
+                        rows,
+                        cols,
+                    ),
+                    (command_history, history_source),
                 )| {
                     TerminalContext {
                         visible_text,
                         selected_text,
                         last_command,
                         last_command_output,
+                        command_history,
+                        history_source,
                         cwd,
                         exit_code,
                         rows,

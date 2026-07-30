@@ -7,6 +7,7 @@ pub mod manpage;
 pub mod ollama;
 pub mod overlay;
 pub mod prompt;
+pub mod session;
 pub mod settings;
 pub mod sysinfo;
 pub mod types;
