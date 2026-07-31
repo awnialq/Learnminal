@@ -10,7 +10,8 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::config::UiConfig;
 use crate::display::SizeInfo;
 use crate::display::color::Rgb;
-use crate::learnminal::settings::ExperienceLevel;
+use crate::learnminal::session;
+use crate::learnminal::settings::{ExperienceLevel, SETTINGS_DIR_NAME};
 use crate::learnminal::types::{CommandEntry, HistorySource, SystemInfo};
 use crate::renderer::rects::RenderRect;
 
@@ -32,11 +33,13 @@ const MSG_TIMEOUT: &str =
     "Response timed out. The model may be overloaded. Try a shorter selection.";
 const MSG_EMPTY_CONTEXT: &str = "Could not read terminal content. Try selecting text manually.";
 
-/// Shell rc lines that enable the command-history hook, shown by `/history` and `/info`.
-const HISTORY_INSTALL_HINT_ZSH: &str =
-    "source ~/.ai-cli-learning/shell/learnminal.zsh    # ~/.zshrc";
-const HISTORY_INSTALL_HINT_BASH: &str =
-    "source ~/.ai-cli-learning/shell/learnminal.bash   # ~/.bashrc";
+/// Shell rc line that enables the command-history hook, shown by `/history`.
+///
+/// Built from the constants `session` publishes the scripts under, so a rename there
+/// cannot leave this pointing at a file that does not exist.
+fn history_install_hint(script: &str, rc_file: &str) -> String {
+    format!("source ~/{SETTINGS_DIR_NAME}/{}/{script}   # {rc_file}", session::SHELL_DIR_NAME)
+}
 
 /// Overlay error panels auto-dismiss after this duration (Req 11 extension).
 pub const ERROR_AUTO_DISMISS_SECS: u64 = 8;
@@ -628,8 +631,8 @@ impl OverlayPanel {
                 lines
                     .push("unavailable. To enable full history, add this to your shell rc:".into());
                 lines.push(String::new());
-                lines.push(HISTORY_INSTALL_HINT_ZSH.into());
-                lines.push(HISTORY_INSTALL_HINT_BASH.into());
+                lines.push(history_install_hint(session::ZSH_SCRIPT_NAME, "~/.zshrc"));
+                lines.push(history_install_hint(session::BASH_SCRIPT_NAME, "~/.bashrc"));
                 lines.push(String::new());
                 lines.push("then open a new Learnminal window.".into());
             },
