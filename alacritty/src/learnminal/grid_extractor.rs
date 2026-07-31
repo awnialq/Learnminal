@@ -7,7 +7,8 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::viewport_to_point;
 
 use crate::learnminal::session::{self, CommandRecord};
-use crate::learnminal::types::{HistorySource, TerminalContext};
+use crate::learnminal::settings::state_dir;
+use crate::learnminal::types::{truncate_with_marker, HistorySource, TerminalContext};
 
 pub const PREFIX_LINES: usize = 40;
 pub const SUFFIX_LINES: usize = 40;
@@ -22,17 +23,13 @@ pub const HISTORY_MAX_ENTRIES: usize = 5;
 
 const PROMPT_CHARS: &[char] = &['$', '#', '%', '❯'];
 
-fn learnminal_state_dir() -> Option<std::path::PathBuf> {
-    session::state_dir()
-}
-
 /// Read the exit code written by the shell hook at `~/.ai-cli-learning/last_exit_code`.
 ///
 /// Shells configure a PRECMD/PROMPT_COMMAND hook that writes `$?` to this file
 /// before each prompt so the terminal can report the actual last exit code.
 /// Returns `None` if the file is missing, unreadable, or contains non-integer text.
 pub fn read_last_exit_code() -> Option<i32> {
-    let path = learnminal_state_dir()?.join("last_exit_code");
+    let path = state_dir()?.join("last_exit_code");
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
@@ -43,7 +40,7 @@ pub fn read_last_exit_code() -> Option<i32> {
 /// output. Process-global, so prefer [`session::Session::recent_commands`] when it
 /// has records: every window overwrites this file.
 pub fn read_last_command() -> Option<String> {
-    let path = learnminal_state_dir()?.join("last_command");
+    let path = state_dir()?.join("last_command");
     let raw = std::fs::read_to_string(path).ok()?.trim().to_owned();
     if raw.is_empty() {
         return None;
@@ -172,14 +169,16 @@ fn collect_recent_lines(grid: &Grid<Cell>, max_lines: usize) -> Vec<String> {
 }
 
 fn line_to_string(grid: &Grid<Cell>, line: Line) -> String {
-    let mut result = String::new();
+    let mut result = String::with_capacity(grid.columns());
     for col in 0..grid.columns() {
         let cell = &grid[line][Column(col)];
         if !cell.flags().contains(Flags::WIDE_CHAR_SPACER) {
             result.push(cell.c);
         }
     }
-    result.trim_end().to_owned()
+    // Trim in place: this runs once per scanned grid line, up to HISTORY_SCAN_LINES.
+    result.truncate(result.trim_end().len());
+    result
 }
 
 fn truncate_lines(all_lines: &[String]) -> String {
@@ -198,19 +197,6 @@ fn truncate_lines(all_lines: &[String]) -> String {
 
 fn truncate_chars(text: String) -> String {
     truncate_with_marker(&text, MAX_CHARS, "\n... [char limit reached]")
-}
-
-/// Truncate to `max_chars` *characters* and append `marker` when anything was cut.
-///
-/// Counts characters, not bytes: slicing at a byte offset panics when it lands inside a
-/// multi-byte character, which would discard the whole context via the `catch_unwind`
-/// in [`extract_context`].
-fn truncate_with_marker(text: &str, max_chars: usize, marker: &str) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-    let kept: String = text.chars().take(max_chars).collect();
-    format!("{kept}{marker}")
 }
 
 /// Extract the most recent command and its output from the visible grid.
@@ -235,7 +221,9 @@ pub struct GridBlock {
     pub prompt_row: usize,
 }
 
-/// Cap on a single block's output, to stay within the LLM context budget.
+/// Memory-safety cap on a single block's output. Deliberately silent and far above any
+/// model-facing budget: `prompt` owns what the model sees and adds its own markers, so a
+/// marker added here would end up quoted in the middle of the text the prompt keeps.
 const MAX_BLOCK_OUTPUT_CHARS: usize = 3_000;
 
 /// Reconstruct up to `max_blocks` command blocks from `lines`, oldest first.
@@ -268,9 +256,8 @@ pub fn extract_command_blocks(lines: &[String], max_blocks: usize) -> Vec<GridBl
             _ => continue,
         };
 
-        let output = lines[cmd_row + 1..next_row].join("\n").trim().to_owned();
-        let output =
-            truncate_with_marker(&output, MAX_BLOCK_OUTPUT_CHARS, "\n... [output truncated]");
+        let output = lines[cmd_row + 1..next_row].join("\n");
+        let output = truncate_with_marker(output.trim(), MAX_BLOCK_OUTPUT_CHARS, "");
 
         blocks.push(GridBlock { command, output, prompt_row: cmd_row });
     }
@@ -633,8 +620,8 @@ mod tests {
         let lines: Vec<String> = vec!["$ cat notes.txt".into(), long_output, "$ ".into()];
         let (cmd, out) = extract_command_block(&lines);
         assert_eq!(cmd, "cat notes.txt");
-        assert!(out.ends_with("[output truncated]"));
-        assert!(out.chars().count() <= 3_000 + "\n... [output truncated]".chars().count());
+        // Capped silently: the prompt layer adds the marker the model sees.
+        assert_eq!(out.chars().count(), MAX_BLOCK_OUTPUT_CHARS);
     }
 
     // ---- extract_command_blocks tests ----

@@ -151,6 +151,20 @@ impl ReferenceContext {
     }
 }
 
+/// Truncate `text` to at most `max_chars` *characters*, appending `marker` if anything
+/// was cut. Pass an empty marker for a silent cap.
+///
+/// Counts characters, not bytes: slicing at a byte offset panics when it lands inside a
+/// multi-byte character, which in the extraction path would discard the whole context.
+/// Scans at most `max_chars + 1` characters, so the cost does not grow with how far the
+/// text overshoots its budget.
+pub fn truncate_with_marker(text: &str, max_chars: usize, marker: &str) -> String {
+    match text.char_indices().nth(max_chars) {
+        None => text.to_owned(),
+        Some((cut, _)) => format!("{}{marker}", text[..cut].trim_end()),
+    }
+}
+
 /// First token of a shell command line (program name).
 pub fn extract_program_name(last_command: &str) -> String {
     let trimmed = last_command.trim();
@@ -238,6 +252,14 @@ mod tests {
         info.collected_at = Some(1);
         info.os = String::new();
         assert!(!info.is_complete());
+    }
+
+    #[test]
+    fn truncate_with_marker_cuts_on_char_boundaries() {
+        assert_eq!(truncate_with_marker("abc", 3, "!"), "abc", "exact fit is left alone");
+        assert_eq!(truncate_with_marker("abcd", 3, "!"), "abc!");
+        assert_eq!(truncate_with_marker("ab  cd", 4, "!"), "ab!", "kept text is right-trimmed");
+        assert_eq!(truncate_with_marker("ééé", 2, ""), "éé", "multi-byte chars must not panic");
     }
 
     #[test]

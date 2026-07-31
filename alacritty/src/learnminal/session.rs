@@ -7,26 +7,31 @@
 //! not installed the history degrades to grid-only parsing.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::{Duration, SystemTime};
 
 use log::warn;
 use serde::{Deserialize, Serialize};
 
 use crate::learnminal::grid_extractor::GridBlock;
-use crate::learnminal::settings::SETTINGS_DIR_NAME;
+use crate::learnminal::settings::{atomic_write, state_dir};
 use crate::learnminal::types::{CommandEntry, HistorySource};
 
-pub const SESSIONS_DIR_NAME: &str = "sessions";
+const SESSIONS_DIR_NAME: &str = "sessions";
+/// Directory the shell integration scripts are published to, and the name of each
+/// script in it. The overlay's install hint is built from these.
 pub const SHELL_DIR_NAME: &str = "shell";
+pub const ZSH_SCRIPT_NAME: &str = "learnminal.zsh";
+pub const BASH_SCRIPT_NAME: &str = "learnminal.bash";
 
-pub const ENV_SESSION_ID: &str = "LEARNMINAL_SESSION_ID";
-pub const ENV_SESSION_FILE: &str = "LEARNMINAL_SESSION_FILE";
-pub const ENV_SESSION_VERSION: &str = "LEARNMINAL_SESSION_VERSION";
+const ENV_SESSION_ID: &str = "LEARNMINAL_SESSION_ID";
+const ENV_SESSION_FILE: &str = "LEARNMINAL_SESSION_FILE";
+const ENV_SESSION_VERSION: &str = "LEARNMINAL_SESSION_VERSION";
 
 /// Record schema version. The shell hooks refuse to run against a different one.
-pub const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 1;
 
 /// Bytes read from the end of a session file; roughly 100 records.
 const TAIL_BYTES: u64 = 16 * 1024;
@@ -41,8 +46,6 @@ const MIN_PREFIX_MATCH_CHARS: usize = 8;
 
 const ZSH_SCRIPT: &str = include_str!("../../../extra/shell-integration/learnminal.zsh");
 const BASH_SCRIPT: &str = include_str!("../../../extra/shell-integration/learnminal.bash");
-/// First line of both scripts; a mismatch means the on-disk copy is stale.
-const SCRIPT_MARKER: &str = "# learnminal-shell-integration v1";
 
 /// One command as recorded by the shell integration hook.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +69,7 @@ pub struct CommandRecord {
 }
 
 /// Identity of one terminal session, shared with its shell through the environment.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Session {
     id: String,
     path: Option<PathBuf>,
@@ -107,17 +110,18 @@ impl Session {
     }
 
     /// Whether the shell integration has recorded anything for this session.
+    ///
+    /// A stat, not a parse: `/info` only needs to know whether the hook is writing, and
+    /// the hook refuses to write at all unless it agrees with [`SCHEMA_VERSION`].
     pub fn is_active(&self) -> bool {
-        !self.recent_commands(1).is_empty()
+        self.path
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .is_some_and(|meta| meta.len() > 0)
     }
 }
 
-/// `~/.ai-cli-learning`, or `None` when the home directory cannot be resolved.
-pub fn state_dir() -> Option<PathBuf> {
-    home::home_dir().map(|home| home.join(SETTINGS_DIR_NAME))
-}
-
-pub fn sessions_dir() -> Option<PathBuf> {
+fn sessions_dir() -> Option<PathBuf> {
     state_dir().map(|dir| dir.join(SESSIONS_DIR_NAME))
 }
 
@@ -129,7 +133,7 @@ pub fn shell_dir() -> Option<PathBuf> {
 ///
 /// Bounded: only the last [`TAIL_BYTES`] are read, so cost is independent of file size.
 /// Never panics; any error yields an empty vector.
-pub fn read_tail_records(path: &Path, max: usize) -> Vec<CommandRecord> {
+fn read_tail_records(path: &Path, max: usize) -> Vec<CommandRecord> {
     let read = || -> std::io::Result<Vec<CommandRecord>> {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len();
@@ -157,11 +161,10 @@ pub fn read_tail_records(path: &Path, max: usize) -> Vec<CommandRecord> {
 ///
 /// `partial_head` says the buffer starts mid-file, in which case the first line is a
 /// fragment and is dropped. A torn final line simply fails to parse and is skipped.
-pub fn parse_tail(bytes: &[u8], partial_head: bool, max: usize) -> Vec<CommandRecord> {
-    if max == 0 {
-        return Vec::new();
-    }
-
+///
+/// Scans newest-first and stops at `max`, so the ~100 records a full tail holds are not
+/// deserialized just to throw all but a dozen away.
+fn parse_tail(bytes: &[u8], partial_head: bool, max: usize) -> Vec<CommandRecord> {
     // Lossy: the tail may begin or end inside a multi-byte character.
     let text = String::from_utf8_lossy(bytes);
     let text = if partial_head {
@@ -173,22 +176,26 @@ pub fn parse_tail(bytes: &[u8], partial_head: bool, max: usize) -> Vec<CommandRe
         text.as_ref()
     };
 
-    let mut records: Vec<CommandRecord> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<CommandRecord>(line).ok())
-        .filter(|record| record.v == SCHEMA_VERSION && !record.cmd.trim().is_empty())
-        .collect();
-
     // Several shells (tmux panes, subshells) can share one file. Keep only the shell
     // that wrote last, so the history reads as one coherent sequence.
-    if let Some(newest_pid) = records.last().map(|record| record.pid) {
-        records.retain(|record| record.pid == newest_pid || record.pid == 0);
+    let mut newest_pid: Option<u32> = None;
+    let mut records: Vec<CommandRecord> = Vec::with_capacity(max.min(16));
+
+    for line in text.lines().rev() {
+        if records.len() == max {
+            break;
+        }
+        let Ok(record) = serde_json::from_str::<CommandRecord>(line) else { continue };
+        if record.v != SCHEMA_VERSION || record.cmd.trim().is_empty() {
+            continue;
+        }
+        let pid = *newest_pid.get_or_insert(record.pid);
+        if record.pid == pid || record.pid == 0 {
+            records.push(record);
+        }
     }
 
-    if records.len() > max {
-        records.drain(..records.len() - max);
-    }
+    records.reverse();
     records
 }
 
@@ -335,36 +342,31 @@ fn cleanup_stale_sessions_in(dir: &Path, current: Option<&Path>, now: SystemTime
 ///
 /// Users source them from there rather than from the install location, which is not
 /// stable across a Homebrew install, a `.app` bundle, and a cargo build.
+///
+/// Runs once per process: every window would otherwise redo the same disk work.
 pub fn ensure_shell_scripts() {
+    static PUBLISHED: Once = Once::new();
+    PUBLISHED.call_once(publish_shell_scripts);
+}
+
+fn publish_shell_scripts() {
     let Some(dir) = shell_dir() else { return };
     if let Err(err) = std::fs::create_dir_all(&dir) {
         warn!("learnminal session: creating {}: {err}", dir.display());
         return;
     }
 
-    for (name, contents) in [("learnminal.zsh", ZSH_SCRIPT), ("learnminal.bash", BASH_SCRIPT)] {
+    for (name, contents) in [(ZSH_SCRIPT_NAME, ZSH_SCRIPT), (BASH_SCRIPT_NAME, BASH_SCRIPT)] {
         let path = dir.join(name);
-        if script_is_current(&path) {
+        // Compare the whole file, not a version header: a fix to the hook's body that
+        // does not bump a version would otherwise never reach anyone who already has it.
+        if std::fs::read_to_string(&path).is_ok_and(|existing| existing == contents) {
             continue;
         }
-        if let Err(err) = write_script(&dir, &path, contents) {
+        if let Err(err) = atomic_write(&dir, &path, contents.as_bytes()) {
             warn!("learnminal session: writing {}: {err}", path.display());
         }
     }
-}
-
-fn script_is_current(path: &Path) -> bool {
-    match std::fs::read_to_string(path) {
-        Ok(existing) => existing.lines().next() == Some(SCRIPT_MARKER),
-        Err(_) => false,
-    }
-}
-
-fn write_script(dir: &Path, path: &Path, contents: &str) -> std::io::Result<()> {
-    let mut tmp = tempfile::Builder::new().prefix(".learnminal").suffix(".tmp").tempfile_in(dir)?;
-    tmp.as_file_mut().write_all(contents.as_bytes())?;
-    tmp.persist(path).map_err(|err| err.error)?;
-    Ok(())
 }
 
 #[cfg(test)]

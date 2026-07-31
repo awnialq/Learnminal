@@ -3,11 +3,14 @@
 //! Combines environment, last command + output + exit code, past journal notes,
 //! a budgeted reference excerpt, and the user's question. Plain text only.
 
+use std::fmt::Write;
 use std::path::Path;
 
 use crate::learnminal::journal::JournalNote;
 use crate::learnminal::settings::ExperienceLevel;
-use crate::learnminal::types::{HistorySource, ReferenceContext, TerminalContext};
+use crate::learnminal::types::{
+    truncate_with_marker, HistorySource, ReferenceContext, TerminalContext,
+};
 
 const CONTEXT_MAX_CHARS: usize = 1_000;
 const EXCERPT_MAX_CHARS: usize = 2_000;
@@ -201,20 +204,20 @@ fn format_command_history(ctx: &TerminalContext) -> Option<String> {
     let mut rendered: Vec<String> = Vec::with_capacity(entries.len());
     let mut used = 0;
 
-    for (age, entry) in entries.iter().rev().enumerate() {
-        let index = entries.len() - 1 - age;
+    for (index, entry) in entries.iter().enumerate().rev() {
+        let age = entries.len() - 1 - index;
         let mut text = format!("$ {}", truncate(entry.command.trim(), HISTORY_COMMAND_MAX_CHARS));
         // A zero exit code is the uninteresting case; matches `context_block`.
         if let Some(code) = entry.exit_code.filter(|code| *code != 0) {
-            text.push_str(&format!("    [exit {code}]"));
+            let _ = write!(text, "    [exit {code}]");
         }
         text.push('\n');
 
         // Show the directory only where it changed, so `cd` stays legible without
         // repeating the same path on every line.
-        let cwd_changed = index == 0 || entries[index - 1].cwd != entry.cwd;
+        let cwd_changed = index.checked_sub(1).is_none_or(|prev| entries[prev].cwd != entry.cwd);
         if !entry.cwd.is_empty() && cwd_changed {
-            text.push_str(&format!("  (cwd: {})\n", entry.cwd));
+            let _ = writeln!(text, "  (cwd: {})", entry.cwd);
         }
 
         let output_budget = HISTORY_OUTPUT_BUDGETS.get(age).copied().unwrap_or(0);
@@ -293,11 +296,7 @@ fn context_block(ctx: &TerminalContext) -> String {
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-    let kept: String = text.chars().take(max_chars).collect();
-    format!("{}\n... [truncated]", kept.trim_end())
+    truncate_with_marker(text, max_chars, "\n... [truncated]")
 }
 
 #[cfg(test)]

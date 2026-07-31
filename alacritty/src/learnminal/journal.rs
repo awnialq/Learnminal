@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::warn;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::learnminal::settings::SETTINGS_DIR_NAME;
+use crate::learnminal::settings::state_dir;
 
 const DB_FILE_NAME: &str = "journal.db";
 pub const GENERAL_PROGRAM: &str = "_general";
@@ -31,7 +31,7 @@ pub struct ProgramSummary {
 }
 
 fn default_db_path() -> Option<PathBuf> {
-    home::home_dir().map(|home| home.join(SETTINGS_DIR_NAME).join(DB_FILE_NAME))
+    state_dir().map(|dir| dir.join(DB_FILE_NAME))
 }
 
 /// Open (or create) the journal database at the default path.
