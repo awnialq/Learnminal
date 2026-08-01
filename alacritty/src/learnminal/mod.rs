@@ -1,5 +1,6 @@
 //! Learnminal AI learning overlay integration.
 
+pub mod actions;
 pub mod docs_fallback;
 pub mod grid_extractor;
 pub mod journal;
@@ -13,6 +14,7 @@ pub mod types;
 pub mod verify;
 pub mod web_search;
 
+pub use actions::ActionItem;
 pub use grid_extractor::{extract_context, read_last_exit_code};
 pub use ollama::{OllamaClient, OllamaError};
 pub use overlay::SlashCommand;

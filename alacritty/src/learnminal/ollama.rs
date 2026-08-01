@@ -277,6 +277,30 @@ impl OllamaClient {
         self.chat_stream_messages(model, &messages, on_chunk, on_done, on_error)
     }
 
+    /// One non-streaming round offering a single tool, returning its raw arguments.
+    ///
+    /// Small models frequently answer with bare JSON text instead of emitting a
+    /// real tool call, so the message content is parsed as a fallback.
+    pub fn call_tool_once(
+        &self,
+        model: &str,
+        prompt: &str,
+        tool: Value,
+        tool_name: &str,
+    ) -> Result<Option<Value>, OllamaError> {
+        let messages = vec![json!({ "role": "user", "content": prompt })];
+        let response = self.chat_once(model, &messages, Some(&[tool]))?;
+        if let Some(error) = response.get("error").and_then(Value::as_str) {
+            return Err(OllamaError::StreamError(error.to_owned()));
+        }
+
+        let message = response.get("message").cloned().unwrap_or(json!({}));
+        if let Some(arguments) = tool_call_arguments(&message, tool_name) {
+            return Ok(Some(arguments));
+        }
+        Ok(parse_embedded_json(&message_content(&message)))
+    }
+
     /// Non-streaming `/api/chat` round (optional tools).
     fn chat_once(
         &self,
@@ -446,6 +470,87 @@ fn web_search_tool_schema() -> Value {
             }
         }
     })
+}
+
+/// Tool the model calls to register the runnable commands from its own answer.
+pub fn actions_tool_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": crate::learnminal::actions::TOOL_NAME,
+            "description": "Register the runnable shell commands contained in an answer, each with a short goal.",
+            "parameters": {
+                "type": "object",
+                "required": ["actions"],
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "description": "Up to 5 commands, most useful first. Empty if the answer has none.",
+                        "items": {
+                            "type": "object",
+                            "required": ["command", "goal"],
+                            "properties": {
+                                "command": {
+                                    "type": "string",
+                                    "description": "A single-line shell command the user can run as-is"
+                                },
+                                "goal": {
+                                    "type": "string",
+                                    "description": "A 2-4 word lowercase phrase describing what the command achieves"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Raw `arguments` of the first call to `tool_name` (object, or JSON in a string).
+fn tool_call_arguments(message: &Value, tool_name: &str) -> Option<Value> {
+    let Some(Value::Array(calls)) = message.get("tool_calls") else {
+        return None;
+    };
+    for call in calls {
+        let function = call.get("function").unwrap_or(call);
+        let name = function.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        if name != tool_name {
+            continue;
+        }
+        match function.get("arguments") {
+            Some(Value::String(text)) => {
+                if let Some(parsed) = parse_embedded_json(text) {
+                    return Some(parsed);
+                }
+            },
+            Some(value) => return Some(value.clone()),
+            None => {},
+        }
+    }
+    None
+}
+
+/// First JSON object or array embedded in `text`, tolerating code fences and prose.
+pub fn parse_embedded_json(text: &str) -> Option<Value> {
+    let trimmed = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    let start = trimmed.find(|c| c == '{' || c == '[')?;
+    let end = trimmed.rfind(|c| c == '}' || c == ']')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Value>(&trimmed[start..=end]).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -818,5 +923,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reply.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn parse_embedded_json_handles_fences_and_prose() {
+        assert_eq!(parse_embedded_json("```json\n{\"a\":1}\n```"), Some(json!({"a": 1})));
+        assert_eq!(parse_embedded_json("here you go: [1,2] cheers"), Some(json!([1, 2])));
+        assert_eq!(parse_embedded_json("no json here"), None);
+        assert_eq!(parse_embedded_json("   "), None);
+    }
+
+    #[test]
+    fn call_tool_once_returns_tool_arguments() {
+        let mut server = start_server();
+        let _mock: Mock = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::PartialJson(json!({ "model": "m", "stream": false })))
+            .with_status(200)
+            .with_body(
+                r#"{"message":{"role":"assistant","tool_calls":[{"function":{"name":"list_actions","arguments":{"actions":[{"command":"ls -l","goal":"show as a list"}]}}}]}}"#,
+            )
+            .create();
+
+        let client = OllamaClient::new(&server.url());
+        let args = client
+            .call_tool_once("m", "prompt", actions_tool_schema(), "list_actions")
+            .unwrap()
+            .expect("tool arguments");
+        assert_eq!(args, json!({"actions": [{"command": "ls -l", "goal": "show as a list"}]}));
+    }
+
+    #[test]
+    fn call_tool_once_falls_back_to_json_content() {
+        let mut server = start_server();
+        let _mock: Mock = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_body(
+                r#"{"message":{"role":"assistant","content":"```json\n{\"actions\":[{\"command\":\"pwd\",\"goal\":\"print cwd\"}]}\n```"}}"#,
+            )
+            .create();
+
+        let client = OllamaClient::new(&server.url());
+        let args = client
+            .call_tool_once("m", "prompt", actions_tool_schema(), "list_actions")
+            .unwrap()
+            .expect("content fallback");
+        assert_eq!(args, json!({"actions": [{"command": "pwd", "goal": "print cwd"}]}));
+    }
+
+    #[test]
+    fn call_tool_once_ignores_other_tools_and_plain_prose() {
+        let mut server = start_server();
+        let _mock: Mock = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_body(
+                r#"{"message":{"role":"assistant","tool_calls":[{"function":{"name":"web_search","arguments":{"query":"x"}}}],"content":"sorry"}}"#,
+            )
+            .create();
+
+        let client = OllamaClient::new(&server.url());
+        let args =
+            client.call_tool_once("m", "prompt", actions_tool_schema(), "list_actions").unwrap();
+        assert_eq!(args, None);
     }
 }

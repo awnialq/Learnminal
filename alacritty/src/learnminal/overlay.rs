@@ -10,6 +10,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::config::UiConfig;
 use crate::display::color::Rgb;
 use crate::display::SizeInfo;
+use crate::learnminal::actions::{ActionItem, MAX_ACTIONS};
 use crate::learnminal::settings::ExperienceLevel;
 use crate::learnminal::types::SystemInfo;
 use crate::renderer::rects::RenderRect;
@@ -26,6 +27,13 @@ const HEADER_ROWS: usize = 2;
 const FOOTER_ROWS: usize = 3;
 const INPUT_MAX_LEN: usize = 256;
 const BORDER_ALPHA: f32 = 0.85;
+
+/// Top-right actions panel. Shares the chat panel's left edge so the two line up.
+const ACTIONS_WIDTH_FRACTION: f32 = PANEL_WIDTH_FRACTION;
+/// Header row plus one row per item; never allowed past this share of the window.
+const ACTIONS_MAX_HEIGHT_FRACTION: f32 = 0.35;
+/// Fraction of the panel width given to the command before the goal column starts.
+const ACTIONS_COMMAND_COLUMN_FRACTION: f32 = 0.55;
 
 const MSG_BACKEND_NOT_RUNNING: &str = "Ollama not running. Start with: ollama serve";
 const MSG_TIMEOUT: &str =
@@ -49,6 +57,8 @@ pub enum SlashCommand {
     Help,
     /// Clear the Chat mode transcript (handled locally).
     Clear,
+    /// Dismiss the top-right actions panel (handled locally).
+    Actions { clear: bool },
 }
 
 impl SlashCommand {
@@ -112,6 +122,12 @@ impl SlashCommand {
             },
             "help" => Some(Ok(Self::Help)),
             "clear" => Some(Ok(Self::Clear)),
+            "actions" => {
+                let clear = words.any(|w| {
+                    w.eq_ignore_ascii_case("clear") || w.eq_ignore_ascii_case("hide")
+                });
+                Some(Ok(Self::Actions { clear }))
+            },
             _ => Some(Err(format!("Unknown command '/{cmd}'. Type /help for available commands."))),
         }
     }
@@ -218,6 +234,12 @@ pub struct OverlayPanel {
     lines_before_error: Option<usize>,
     /// True when the overlay shows only an error (no prior explanation content).
     error_only: bool,
+    /// Runnable commands pulled out of the last reply, shown top-right.
+    actions: Vec<ActionItem>,
+    /// True between the end of a reply and the arrival of its actions.
+    actions_pending: bool,
+    /// Set by `/actions clear`; cleared when a new question is asked.
+    actions_dismissed: bool,
 }
 
 impl Default for OverlayPanel {
@@ -251,6 +273,9 @@ impl OverlayPanel {
             chat_stream_line: None,
             lines_before_error: None,
             error_only: false,
+            actions: Vec::new(),
+            actions_pending: false,
+            actions_dismissed: false,
         }
     }
 
@@ -314,9 +339,54 @@ impl OverlayPanel {
 
     /// Request a fresh layout pass after the window or cell metrics change.
     pub fn on_window_resize(&mut self) {
-        if self.visible {
+        if self.visible || self.actions_panel_visible() {
             self.needs_redraw = true;
         }
+    }
+
+    /// Start a new question: drop the previous answer's actions and show the pending row.
+    pub fn begin_actions(&mut self) {
+        self.actions.clear();
+        self.actions_pending = true;
+        self.actions_dismissed = false;
+        self.needs_redraw = true;
+    }
+
+    /// Install the actions extracted from the reply that just finished.
+    pub fn set_actions(&mut self, actions: Vec<ActionItem>) {
+        self.actions = actions;
+        self.actions_pending = false;
+        self.needs_redraw = true;
+    }
+
+    /// Dismiss the panel until the next question (`/actions clear`).
+    pub fn clear_actions(&mut self) {
+        self.actions.clear();
+        self.actions_pending = false;
+        self.actions_dismissed = true;
+        self.needs_redraw = true;
+    }
+
+    /// True while the top-right panel should be painted.
+    ///
+    /// Deliberately independent of [`Self::is_visible`]: the actions panel outlives
+    /// the chat panel so the commands stay readable while typing in the shell.
+    pub fn actions_panel_visible(&self) -> bool {
+        !self.actions_dismissed && (self.actions_pending || !self.actions.is_empty())
+    }
+
+    pub fn actions(&self) -> &[ActionItem] {
+        &self.actions
+    }
+
+    /// Item at `index` (0-based), for a future "run this command" binding.
+    ///
+    /// Nothing executes today. To wire it up: emit a new `OverlayAction::RunAction(index)`
+    /// from a numeric branch in [`Self::dispatch_key`], handle it in the overlay
+    /// interception block in `input/keyboard.rs`, and have the new `ActionContext`
+    /// method call `write_to_pty` (run) or `paste` (insert without running) in `event.rs`.
+    pub fn action_at(&self, index: usize) -> Option<&ActionItem> {
+        self.actions.get(index)
     }
 
     /// Attach terminal context shown in the highlighted block at the top.
@@ -577,12 +647,41 @@ impl OverlayPanel {
                 "/journal <program> — show recent notes for a program".into(),
                 "/journal clear <program> — delete notes for a program".into(),
                 "/clear — clear the Chat transcript".into(),
+                "/actions — list the commands in the Actions panel".into(),
+                "/actions clear — dismiss the Actions panel".into(),
                 "/help — show this list".into(),
                 "".into(),
                 "Ctrl+Shift+E → open Chat.".into(),
                 "Tab → toggle Chat / Command focus.".into(),
             ],
         );
+    }
+
+    /// Echo the current actions into the transcript (`/actions`).
+    pub fn show_actions_summary(&mut self) {
+        if self.actions.is_empty() {
+            let hint = if self.actions_pending {
+                "Still extracting actions from the last answer."
+            } else {
+                "No actions from the last answer yet. Ask a question first."
+            };
+            self.show_slash_message("Actions", &[hint.into()]);
+            return;
+        }
+
+        let lines: Vec<String> = self
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                if action.goal.is_empty() {
+                    format!("{}. {}", i + 1, action.command)
+                } else {
+                    format!("{}. {} — {}", i + 1, action.command, action.goal)
+                }
+            })
+            .collect();
+        self.show_slash_message("Actions", &lines);
     }
 
     /// Display system environment from `GET /system-info`.
@@ -825,6 +924,14 @@ impl OverlayPanel {
                             self.clear_chat_output();
                             OverlayAction::None
                         },
+                        Ok(SlashCommand::Actions { clear }) => {
+                            if clear {
+                                self.clear_actions();
+                            } else {
+                                self.show_actions_summary();
+                            }
+                            OverlayAction::None
+                        },
                         Ok(cmd @ SlashCommand::Info { .. }) => OverlayAction::RunSlashCommand(cmd),
                         Ok(cmd @ SlashCommand::Model { .. }) => OverlayAction::RunSlashCommand(cmd),
                         Ok(cmd @ SlashCommand::Journal { .. }) => {
@@ -911,6 +1018,131 @@ impl OverlayPanel {
         let x = size_info.width() - width;
         let y = size_info.height() - height;
         (x, y, width, height)
+    }
+
+    /// Rows the actions panel occupies: one header plus one per item (or the pending row).
+    fn actions_row_count(&self) -> usize {
+        let items = if self.actions.is_empty() { 1 } else { self.actions.len().min(MAX_ACTIONS) };
+        1 + items
+    }
+
+    /// Top-right actions panel: `(x, y, width, height)` in pixels.
+    ///
+    /// Height follows the item count instead of a fixed fraction, and is clamped so the
+    /// panel can never grow down into the bottom-right chat panel.
+    pub fn actions_panel_geometry(&self, size_info: &SizeInfo) -> (f32, f32, f32, f32) {
+        let width = size_info.width() * ACTIONS_WIDTH_FRACTION;
+        let cell_h = size_info.cell_height().max(1.0);
+        let max_height = size_info.height() * ACTIONS_MAX_HEIGHT_FRACTION;
+        let height = (self.actions_row_count() as f32 * cell_h).min(max_height);
+        (size_info.width() - width, 0., width, height)
+    }
+
+    /// True when `(x, y)` pixel coordinates lie inside the top-right actions panel.
+    pub fn contains_actions_point(&self, x: f32, y: f32, size_info: &SizeInfo) -> bool {
+        if !self.actions_panel_visible() {
+            return false;
+        }
+        let (px, py, pw, ph) = self.actions_panel_geometry(size_info);
+        x >= px && x < px + pw && y >= py && y < py + ph
+    }
+
+    /// Build rects and styled text for the top-right actions panel.
+    pub fn prepare_actions_draw(&self, size_info: &SizeInfo, config: &UiConfig) -> OverlayDrawData {
+        let mut data = OverlayDrawData::default();
+        if !self.actions_panel_visible() {
+            return data;
+        }
+
+        let (panel_x, panel_y, panel_w, panel_h) = self.actions_panel_geometry(size_info);
+        let cell_w = size_info.cell_width().max(1.0);
+        let cell_h = size_info.cell_height().max(1.0);
+        let theme = Theme::from_config(config, OverlayMode::Normal);
+
+        // Backdrop and left accent stripe, mirroring the chat panel's chrome.
+        data.rects.push(RenderRect::new(
+            panel_x,
+            panel_y,
+            panel_w,
+            panel_h,
+            theme.panel_bg,
+            PANEL_ALPHA,
+        ));
+        data.rects.push(RenderRect::new(
+            panel_x,
+            panel_y,
+            ACCENT_WIDTH_PX.min(panel_w),
+            panel_h,
+            theme.accent,
+            1.0,
+        ));
+        data.rects.push(RenderRect::new(
+            panel_x + ACCENT_WIDTH_PX,
+            panel_y,
+            panel_w - ACCENT_WIDTH_PX,
+            cell_h,
+            theme.header_bg,
+            BORDER_ALPHA,
+        ));
+
+        let start_row = (panel_y / cell_h).floor() as usize;
+        let start_col = Column((panel_x / cell_w).floor() as usize + 1).0.saturating_add(1);
+        let panel_cols = ((panel_w / cell_w) as usize).saturating_sub(3).max(1);
+        let visible_rows = (panel_h / cell_h).floor() as usize;
+
+        data.texts.push(OverlayText {
+            point: Point::new(start_row, Column(start_col)),
+            text: pad_line(" Actions ", panel_cols),
+            fg: theme.title_fg,
+            bg: theme.header_bg,
+        });
+
+        if self.actions.is_empty() {
+            // Only reachable while pending — `actions_panel_visible` gates the empty case.
+            data.texts.push(OverlayText {
+                point: Point::new(start_row + 1, Column(start_col)),
+                text: pad_line("  ◐  Finding actions…", panel_cols),
+                fg: theme.muted_fg,
+                bg: theme.panel_bg,
+            });
+            return data;
+        }
+
+        let (command_fg, row_bg) = theme.colors(LineStyle::Code, OverlayMode::Normal);
+        let goal_col = ((panel_cols as f32 * ACTIONS_COMMAND_COLUMN_FRACTION) as usize).max(1);
+
+        for (index, action) in self.actions.iter().take(MAX_ACTIONS).enumerate() {
+            let row = start_row + 1 + index;
+            if 1 + index >= visible_rows {
+                break;
+            }
+
+            // Full-width padded row first so the panel background is solid, then the
+            // goal is overdrawn in muted color at a fixed column.
+            let label = format!(" {}. {}", index + 1, action.command);
+            data.texts.push(OverlayText {
+                point: Point::new(row, Column(start_col)),
+                text: pad_line(&label, panel_cols),
+                fg: command_fg,
+                bg: row_bg,
+            });
+
+            if action.goal.is_empty() || text_display_width(&label) + 1 > goal_col {
+                continue;
+            }
+            let goal_cols = panel_cols.saturating_sub(goal_col);
+            if goal_cols == 0 {
+                continue;
+            }
+            data.texts.push(OverlayText {
+                point: Point::new(row, Column(start_col + goal_col)),
+                text: pad_line(&truncate_to_width(&action.goal, goal_cols), goal_cols),
+                fg: theme.muted_fg,
+                bg: row_bg,
+            });
+        }
+
+        data
     }
 
     /// Terminal region left of the corner panel: `(x, y, width, height)`.
@@ -1481,6 +1713,112 @@ mod tests {
         assert!(draw.texts.iter().any(|t| t.text.contains('>')));
     }
 
+    // ---- Actions panel (top-right) ----
+
+    fn action(command: &str, goal: &str) -> ActionItem {
+        ActionItem { command: command.into(), goal: goal.into() }
+    }
+
+    #[test]
+    fn actions_panel_hidden_until_a_question_is_asked() {
+        let panel = OverlayPanel::new();
+        assert!(!panel.actions_panel_visible());
+    }
+
+    #[test]
+    fn actions_panel_shows_pending_then_items() {
+        let mut panel = OverlayPanel::new();
+        panel.begin_actions();
+        assert!(panel.actions_panel_visible(), "pending state should show the panel");
+
+        panel.set_actions(vec![action("ls -l", "show as a list")]);
+        assert!(panel.actions_panel_visible());
+        assert_eq!(panel.actions().len(), 1);
+    }
+
+    #[test]
+    fn empty_extraction_result_hides_the_panel() {
+        let mut panel = OverlayPanel::new();
+        panel.begin_actions();
+        panel.set_actions(Vec::new());
+        assert!(!panel.actions_panel_visible());
+    }
+
+    #[test]
+    fn actions_survive_closing_the_chat_panel() {
+        let mut panel = OverlayPanel::new();
+        panel.show();
+        panel.set_actions(vec![action("du -sh *", "check dir sizes")]);
+        panel.hide();
+
+        assert!(!panel.is_visible());
+        assert!(panel.actions_panel_visible(), "actions must outlive the chat panel");
+    }
+
+    #[test]
+    fn slash_actions_clear_dismisses_until_next_question() {
+        let mut panel = OverlayPanel::new();
+        panel.set_actions(vec![action("ls", "list files")]);
+
+        panel.clear_actions();
+        assert!(!panel.actions_panel_visible());
+
+        panel.begin_actions();
+        assert!(panel.actions_panel_visible(), "a new question un-dismisses the panel");
+    }
+
+    #[test]
+    fn parses_actions_slash_command() {
+        assert_eq!(
+            SlashCommand::parse("/actions"),
+            Some(Ok(SlashCommand::Actions { clear: false }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/actions clear"),
+            Some(Ok(SlashCommand::Actions { clear: true }))
+        );
+    }
+
+    #[test]
+    fn actions_draw_renders_numbered_commands_and_goals() {
+        let mut panel = OverlayPanel::new();
+        panel.set_actions(vec![
+            action("ls -l", "show as a list"),
+            action("du -sh *", "check dir sizes"),
+        ]);
+        let size = SizeInfo::new(1000., 800., 10., 20., 0., 0., false);
+        let draw = panel.prepare_actions_draw(&size, &UiConfig::default());
+
+        assert!(draw.texts.iter().any(|t| t.text.contains("Actions")));
+        assert!(draw.texts.iter().any(|t| t.text.contains("1. ls -l")));
+        assert!(draw.texts.iter().any(|t| t.text.contains("2. du -sh *")));
+        assert!(draw.texts.iter().any(|t| t.text.contains("show as a list")));
+        assert!(draw.texts.iter().any(|t| t.text.contains("check dir sizes")));
+    }
+
+    #[test]
+    fn actions_draw_is_empty_when_not_visible() {
+        let panel = OverlayPanel::new();
+        let size = SizeInfo::new(1000., 800., 10., 20., 0., 0., false);
+        let draw = panel.prepare_actions_draw(&size, &UiConfig::default());
+        assert!(draw.rects.is_empty() && draw.texts.is_empty());
+    }
+
+    #[test]
+    fn actions_panel_grows_with_item_count() {
+        let size = SizeInfo::new(1000., 800., 10., 20., 0., 0., false);
+
+        let mut one = OverlayPanel::new();
+        one.set_actions(vec![action("ls", "list")]);
+        let (_, _, _, h1) = one.actions_panel_geometry(&size);
+
+        let mut three = OverlayPanel::new();
+        three.set_actions(vec![action("ls", "a"), action("pwd", "b"), action("id", "c")]);
+        let (_, _, _, h3) = three.actions_panel_geometry(&size);
+
+        assert!(h3 > h1);
+    }
+
     // ---- Task 5.2: Unit tests for handle_key/dispatch_key ----
 
     #[test]
@@ -1846,6 +2184,43 @@ mod tests {
             prop_assert!((panel_h - expected_h).abs() < 0.01);
             prop_assert!((x + panel_w - width_px as f32).abs() < 0.01);
             prop_assert!((y + panel_h - height_px as f32).abs() < 0.01);
+        }
+
+        /// The top-right actions panel is anchored to the top-right corner and can
+        /// never grow down into the bottom-right chat panel.
+        #[test]
+        fn actions_panel_never_overlaps_chat_panel(
+            width_px in 200u32..4000,
+            height_px in 200u32..3000,
+            cell_w in 6u32..30,
+            cell_h in 10u32..40,
+            item_count in 1usize..MAX_ACTIONS + 1,
+        ) {
+            let mut panel = OverlayPanel::new();
+            panel.set_actions(
+                (0..item_count)
+                    .map(|i| ActionItem { command: format!("cmd{i}"), goal: "go".into() })
+                    .collect(),
+            );
+            let size = SizeInfo::new(
+                width_px as f32,
+                height_px as f32,
+                cell_w as f32,
+                cell_h as f32,
+                0.,
+                0.,
+                false,
+            );
+
+            let (ax, ay, aw, ah) = panel.actions_panel_geometry(&size);
+            let (_, chat_y, _, _) = panel.panel_geometry(&size);
+
+            // Anchored top-right.
+            prop_assert!((ay - 0.).abs() < 0.01);
+            prop_assert!((ax + aw - width_px as f32).abs() < 0.01);
+            // Bounded, and clear of the chat panel below.
+            prop_assert!(ah <= height_px as f32 * ACTIONS_MAX_HEIGHT_FRACTION + 0.01);
+            prop_assert!(ay + ah <= chat_y + 0.01);
         }
     }
 }

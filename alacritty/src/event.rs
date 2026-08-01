@@ -66,8 +66,8 @@ use crate::learnminal::sysinfo;
 use crate::learnminal::types::resolve_program;
 use crate::learnminal::verify::{append_footer, verify_reply};
 use crate::learnminal::{
-    extract_context, read_last_exit_code, OllamaClient, OllamaError, SlashCommand, SystemInfo,
-    TerminalContext,
+    extract_context, read_last_exit_code, ActionItem, OllamaClient, OllamaError, SlashCommand,
+    SystemInfo, TerminalContext,
 };
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer, MessageType};
@@ -632,6 +632,11 @@ pub enum LearnminalEvent {
         generation: u64,
         info: SystemInfo,
     },
+    /// Runnable commands extracted from a finished reply (top-right panel).
+    ActionsReady {
+        generation: u64,
+        actions: Vec<ActionItem>,
+    },
     /// Hide transient overlay error after `LEARNMINAL_ERROR_DISMISS` (Req 11).
     DismissError,
 }
@@ -1055,6 +1060,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         }
 
         let terminal_ctx = self.current_terminal_context();
+        self.display.learnminal_overlay.begin_actions();
         self.spawn_learnminal_chat(terminal_ctx, query);
         self.request_redraw();
     }
@@ -1084,7 +1090,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 self.display.learnminal_overlay.begin_slash_command("/level");
                 self.run_learnminal_level(level, list);
             },
-            SlashCommand::Help | SlashCommand::Clear => {},
+            // Handled entirely inside the overlay's key dispatch.
+            SlashCommand::Help | SlashCommand::Clear | SlashCommand::Actions { .. } => {},
         }
         self.request_redraw();
     }
@@ -1872,7 +1879,9 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             let client = OllamaClient::default_client();
             let last_command = terminal_ctx.last_command.clone();
             let enable_web_search = crate::learnminal::web_search::web_search_enabled();
+            let enable_actions = crate::learnminal::actions::actions_enabled();
             let result = client.resolve_active_model().and_then(|(model, _)| {
+                let actions_model = model.clone();
                 client.chat_with_tools_loop(
                     &model,
                     &prompt,
@@ -1916,10 +1925,29 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                         let _ = proxy.send_event(Event::new(
                             EventType::Learnminal(LearnminalEvent::ChatDone {
                                 generation,
-                                reply: final_reply,
+                                reply: final_reply.clone(),
                             }),
                             window_id,
                         ));
+
+                        // Second, structured round: have the model re-read the answer it
+                        // just gave and register the commands it contains. Runs after
+                        // ChatDone so the visible reply is never delayed by it.
+                        if enable_actions {
+                            let actions = crate::learnminal::actions::extract_actions(
+                                &client,
+                                &actions_model,
+                                &final_reply,
+                                &last_command,
+                            );
+                            let _ = proxy.send_event(Event::new(
+                                EventType::Learnminal(LearnminalEvent::ActionsReady {
+                                    generation,
+                                    actions,
+                                }),
+                                window_id,
+                            ));
+                        }
                     },
                     |error| {
                         let _ = proxy.send_event(Event::new(
@@ -2402,6 +2430,15 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             self.ctx.cancel_learnminal_error_dismiss();
                             self.ctx.display.learnminal_overlay.finalize_chat(&reply);
                         },
+                        LearnminalEvent::ActionsReady { generation, actions }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
+                            self.ctx.display.learnminal_overlay.set_actions(actions);
+                        },
                         LearnminalEvent::ModelsListed { generation, models, current }
                             if !self
                                 .ctx
@@ -2501,7 +2538,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         | LearnminalEvent::SseError { .. }
                         | LearnminalEvent::BackendNotRunning { .. }
                         | LearnminalEvent::Timeout { .. }
-                        | LearnminalEvent::SystemInfo { .. } => {},
+                        | LearnminalEvent::SystemInfo { .. }
+                        | LearnminalEvent::ActionsReady { .. } => {},
                     }
                     *self.ctx.dirty = true;
                     self.ctx.display.pending_update.dirty = true;

@@ -51,6 +51,7 @@ use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
+use crate::learnminal::overlay::OverlayDrawData;
 use crate::learnminal::OverlayPanel;
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
@@ -548,16 +549,33 @@ impl Display {
     }
 
     fn draw_learnminal_overlay(&mut self, config: &UiConfig) {
-        if !self.learnminal_overlay.is_visible() {
+        let chat_visible = self.learnminal_overlay.is_visible();
+        let actions_visible = self.learnminal_overlay.actions_panel_visible();
+        if !chat_visible && !actions_visible {
             return;
         }
 
         // Always paint the overlay when visible. Skipping draws during the 16ms batch
-        // window left the panel blank after loading text was removed.
+        // window left the panel blank after loading text was removed. Full damage is
+        // also what keeps the actions panel intact once the chat panel is closed.
         self.learnminal_overlay.flush_pending();
         self.damage_tracker.frame().mark_fully_damaged();
 
-        let draw = self.learnminal_overlay.prepare_draw(&self.size_info, config);
+        if chat_visible {
+            let draw = self.learnminal_overlay.prepare_draw(&self.size_info, config);
+            self.render_overlay_data(draw);
+        }
+
+        if actions_visible {
+            let draw = self.learnminal_overlay.prepare_actions_draw(&self.size_info, config);
+            self.render_overlay_data(draw);
+        }
+
+        self.learnminal_overlay.clear_needs_redraw();
+    }
+
+    /// Paint one overlay panel's rects and text runs.
+    fn render_overlay_data(&mut self, draw: OverlayDrawData) {
         let metrics = self.glyph_cache.font_metrics();
         if !draw.rects.is_empty() {
             self.renderer.draw_rects(&self.size_info, &metrics, draw.rects);
@@ -572,8 +590,6 @@ impl Display {
                 &mut self.glyph_cache,
             );
         }
-
-        self.learnminal_overlay.clear_needs_redraw();
     }
 
     #[inline]
@@ -767,9 +783,8 @@ impl Display {
             // Clear focused search match.
             search_state.clear_focused_match();
 
-            if self.learnminal_overlay.is_visible() {
-                self.learnminal_overlay.on_window_resize();
-            }
+            // `on_window_resize` covers the chat panel and the standalone actions panel.
+            self.learnminal_overlay.on_window_resize();
         }
         self.size_info = new_size;
     }
