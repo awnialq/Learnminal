@@ -1060,8 +1060,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         }
 
         let terminal_ctx = self.current_terminal_context();
-        self.display.learnminal_overlay.begin_actions();
-        self.spawn_learnminal_chat(terminal_ctx, query);
+        let generation = self.spawn_learnminal_chat(terminal_ctx, query);
+        // Only show the pending row when the worker will actually extract actions,
+        // otherwise the spinner has nothing that can ever resolve it.
+        if crate::learnminal::actions::actions_enabled() {
+            self.display.learnminal_overlay.begin_actions(generation);
+        }
         self.request_redraw();
     }
 
@@ -1698,6 +1702,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     fn cancel_learnminal_inflight(&mut self) {
+        // Abandon the question only if it never finished answering. Once the reply is on
+        // screen, closing the overlay is how you go read the actions in the shell.
+        if self.display.learnminal_overlay.chat_active() {
+            self.display.learnminal_overlay.abandon_actions();
+        }
         self.display.learnminal_overlay.bump_request_generation();
         self.cancel_learnminal_backend_streams();
     }
@@ -1855,7 +1864,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         }
     }
 
-    fn spawn_learnminal_chat(&self, terminal_ctx: TerminalContext, message: String) {
+    /// Returns the request generation the spawned chat reports its events under.
+    fn spawn_learnminal_chat(&self, terminal_ctx: TerminalContext, message: String) -> u64 {
         let proxy = self.event_proxy.clone();
         let window_id = self.display.window.id();
         let generation = self.display.learnminal_overlay.bump_request_generation();
@@ -1966,6 +1976,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 let _ = proxy.send_event(Event::new(EventType::Learnminal(event), window_id));
             }
         });
+
+        generation
     }
 
     fn update_search(&mut self) {
@@ -2435,7 +2447,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                                 .ctx
                                 .display
                                 .learnminal_overlay
-                                .is_stale_request(generation) =>
+                                .is_stale_actions(generation) =>
                         {
                             self.ctx.display.learnminal_overlay.set_actions(actions);
                         },

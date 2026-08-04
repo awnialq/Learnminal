@@ -226,6 +226,11 @@ pub struct OverlayPanel {
     needs_redraw: bool,
     /// Monotonic request generation — stale responses are ignored.
     request_generation: Cell<u64>,
+    /// Generation of the chat whose actions are currently being extracted.
+    ///
+    /// Deliberately separate from `request_generation`: extraction outlives the chat
+    /// request, so closing the overlay or running a slash command must not invalidate it.
+    actions_generation: Cell<u64>,
     /// True while streaming a chat answer.
     chat_active: bool,
     /// Index in `chat_lines` of the in-progress assistant reply (for live token append).
@@ -269,6 +274,7 @@ impl OverlayPanel {
             has_chunks: false,
             needs_redraw: false,
             request_generation: Cell::new(0),
+            actions_generation: Cell::new(0),
             chat_active: false,
             chat_stream_line: None,
             lines_before_error: None,
@@ -345,11 +351,32 @@ impl OverlayPanel {
     }
 
     /// Start a new question: drop the previous answer's actions and show the pending row.
-    pub fn begin_actions(&mut self) {
+    ///
+    /// `generation` is the chat request the actions will belong to; it makes any extraction
+    /// still in flight for an earlier question stale.
+    pub fn begin_actions(&mut self, generation: u64) {
         self.actions.clear();
         self.actions_pending = true;
         self.actions_dismissed = false;
+        self.actions_generation.set(generation);
         self.needs_redraw = true;
+    }
+
+    /// Extraction is over with nothing to install (error, or the feature is off).
+    ///
+    /// Unlike [`Self::clear_actions`] this is not a user dismissal, so the next question
+    /// still shows the panel.
+    pub fn finish_actions(&mut self) {
+        if self.actions_pending {
+            self.actions_pending = false;
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Give up on the in-flight extraction: hide the pending row and drop its late result.
+    pub fn abandon_actions(&mut self) {
+        self.finish_actions();
+        self.actions_generation.set(self.actions_generation.get().wrapping_add(1));
     }
 
     /// Install the actions extracted from the reply that just finished.
@@ -465,6 +492,16 @@ impl OverlayPanel {
 
     pub fn is_stale_request(&self, generation: u64) -> bool {
         generation != self.request_generation.get()
+    }
+
+    /// True when `generation` no longer matches the extraction the panel is waiting for.
+    pub fn is_stale_actions(&self, generation: u64) -> bool {
+        generation != self.actions_generation.get()
+    }
+
+    /// True while a chat reply is still streaming.
+    pub fn chat_active(&self) -> bool {
+        self.chat_active
     }
 
     pub fn request_generation(&self) -> u64 {
@@ -812,6 +849,8 @@ impl OverlayPanel {
         self.visible = true;
         self.mode = OverlayMode::Error;
         self.has_chunks = true;
+        // The chat died, so `on_done` — the only sender of `ActionsReady` — never runs.
+        self.finish_actions();
         let mut error_lines = vec![DisplayLine { text: message.into(), style: LineStyle::Error }];
         if ollama {
             error_lines.push(DisplayLine {
@@ -1728,7 +1767,7 @@ mod tests {
     #[test]
     fn actions_panel_shows_pending_then_items() {
         let mut panel = OverlayPanel::new();
-        panel.begin_actions();
+        panel.begin_actions(1);
         assert!(panel.actions_panel_visible(), "pending state should show the panel");
 
         panel.set_actions(vec![action("ls -l", "show as a list")]);
@@ -1739,7 +1778,7 @@ mod tests {
     #[test]
     fn empty_extraction_result_hides_the_panel() {
         let mut panel = OverlayPanel::new();
-        panel.begin_actions();
+        panel.begin_actions(1);
         panel.set_actions(Vec::new());
         assert!(!panel.actions_panel_visible());
     }
@@ -1763,8 +1802,69 @@ mod tests {
         panel.clear_actions();
         assert!(!panel.actions_panel_visible());
 
-        panel.begin_actions();
+        panel.begin_actions(1);
         assert!(panel.actions_panel_visible(), "a new question un-dismisses the panel");
+    }
+
+    #[test]
+    fn actions_generation_tracks_the_question_it_belongs_to() {
+        let mut panel = OverlayPanel::new();
+        panel.begin_actions(7);
+
+        assert!(!panel.is_stale_actions(7));
+        assert!(panel.is_stale_actions(6));
+    }
+
+    #[test]
+    fn actions_generation_ignores_unrelated_request_bumps() {
+        // Closing the overlay or running a slash command bumps the request generation;
+        // extraction started before that must still be accepted.
+        let mut panel = OverlayPanel::new();
+        panel.begin_actions(3);
+        panel.bump_request_generation();
+        panel.bump_request_generation();
+
+        assert!(!panel.is_stale_actions(3), "a slash command must not orphan the extraction");
+    }
+
+    #[test]
+    fn a_new_question_invalidates_the_previous_extraction() {
+        let mut panel = OverlayPanel::new();
+        panel.begin_actions(1);
+        panel.begin_actions(2);
+
+        assert!(panel.is_stale_actions(1));
+        assert!(!panel.is_stale_actions(2));
+    }
+
+    #[test]
+    fn abandoning_actions_hides_the_panel_and_drops_the_late_result() {
+        let mut panel = OverlayPanel::new();
+        panel.begin_actions(4);
+        panel.abandon_actions();
+
+        assert!(!panel.actions_panel_visible());
+        assert!(panel.is_stale_actions(4), "the cancelled question's actions must be dropped");
+    }
+
+    #[test]
+    fn errors_resolve_the_pending_actions_row() {
+        let mut panel = OverlayPanel::new();
+        panel.begin_actions(1);
+        panel.show_sse_error("stream broke");
+
+        assert!(!panel.actions_panel_visible(), "an errored chat must not leave a spinner");
+    }
+
+    #[test]
+    fn finishing_actions_is_not_a_user_dismissal() {
+        let mut panel = OverlayPanel::new();
+        panel.begin_actions(1);
+        panel.finish_actions();
+        assert!(!panel.actions_panel_visible());
+
+        panel.begin_actions(2);
+        assert!(panel.actions_panel_visible(), "the next question still shows the panel");
     }
 
     #[test]
