@@ -92,6 +92,41 @@ Slash commands in the overlay:
 - `/info` — show cached system environment
 - `/actions` — list the current actions in the transcript
 - `/actions clear` — dismiss the Actions panel
+- `/history` — show the recent commands the AI can see
+
+## Shell integration (recommended)
+
+Without it, Learnminal reconstructs your recent commands by scanning the terminal
+screen for prompt characters, which cannot recover exit codes for anything but the
+very last command. The shell hook records each command's exact text, exit code, and
+working directory instead.
+
+Learnminal writes the scripts to `~/.ai-cli-learning/shell/` on startup. Add one line
+to your shell rc file:
+
+```bash
+# ~/.zshrc
+[ -f "$HOME/.ai-cli-learning/shell/learnminal.zsh" ] && source "$HOME/.ai-cli-learning/shell/learnminal.zsh"
+
+# ~/.bashrc
+[ -f "$HOME/.ai-cli-learning/shell/learnminal.bash" ] && source "$HOME/.ai-cli-learning/shell/learnminal.bash"
+```
+
+Then open a new Learnminal window and run `/history` to confirm it says
+`Source: shell hook`.
+
+Each command appends one JSON line to `~/.ai-cli-learning/sessions/<session-id>.jsonl`
+(directory mode 700). Files are rotated at 500 commands and swept after 24 hours.
+
+**Privacy.** The commands you run, and the output visible on screen, are sent to your
+local Ollama model when you ask a question. Secrets typed as command arguments are
+included. Set `LEARNMINAL_NO_HISTORY=1` to turn recording off for a shell. Command
+output is never written to disk — only to the model, and only from the live screen.
+
+**bash caveats.** bash has no `preexec` hook, so the script installs a `DEBUG` trap and
+prepends to `PROMPT_COMMAND`. It detects and cooperates with bash-preexec, starship, and
+oh-my-bash; a hand-rolled `trap ... DEBUG` of your own will conflict. Shell history must
+be enabled (the interactive default).
 
 Default model: `gemma4:e4b-mlx` on macOS, `gemma4:e4b` elsewhere. Override with
 `LEARNMINAL_OLLAMA_MODEL` or persist a choice via `/model`.

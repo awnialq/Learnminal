@@ -1,5 +1,4 @@
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
 
 use alacritty_terminal::grid::{Dimensions, Grid, GridCell};
 use alacritty_terminal::index::{Column, Line, Point};
@@ -7,17 +6,22 @@ use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::viewport_to_point;
 
-use crate::learnminal::types::TerminalContext;
+use crate::learnminal::session::{self, CommandRecord};
+use crate::learnminal::settings::state_dir;
+use crate::learnminal::types::{truncate_with_marker, HistorySource, TerminalContext};
 
 pub const PREFIX_LINES: usize = 40;
 pub const SUFFIX_LINES: usize = 40;
 pub const MAX_CHARS: usize = 8000;
 
-const PROMPT_CHARS: &[char] = &['$', '#', '%', '❯'];
+/// Grid lines (scrollback + screen) scanned when reconstructing command blocks.
+pub const HISTORY_SCAN_LINES: usize = 500;
+/// Command blocks reconstructed from the grid before matching against shell records.
+pub const HISTORY_MAX_BLOCKS: usize = 12;
+/// Commands reported in [`TerminalContext::command_history`].
+pub const HISTORY_MAX_ENTRIES: usize = 5;
 
-fn learnminal_state_dir() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".ai-cli-learning"))
-}
+const PROMPT_CHARS: &[char] = &['$', '#', '%', '❯'];
 
 /// Read the exit code written by the shell hook at `~/.ai-cli-learning/last_exit_code`.
 ///
@@ -25,16 +29,18 @@ fn learnminal_state_dir() -> Option<PathBuf> {
 /// before each prompt so the terminal can report the actual last exit code.
 /// Returns `None` if the file is missing, unreadable, or contains non-integer text.
 pub fn read_last_exit_code() -> Option<i32> {
-    let path = learnminal_state_dir()?.join("last_exit_code");
+    let path = state_dir()?.join("last_exit_code");
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Read the last executed command from `~/.ai-cli-learning/last_command`.
 ///
-/// Written by the shell precmd hook (see INSTALL.md). More reliable than parsing
-/// the terminal grid, which can false-match `$` in command output.
+/// Written by the shell precmd hook (see "Shell integration" in README.md). More
+/// reliable than parsing the terminal grid, which can false-match `$` in command
+/// output. Process-global, so prefer [`session::Session::recent_commands`] when it
+/// has records: every window overwrites this file.
 pub fn read_last_command() -> Option<String> {
-    let path = learnminal_state_dir()?.join("last_command");
+    let path = state_dir()?.join("last_command");
     let raw = std::fs::read_to_string(path).ok()?.trim().to_owned();
     if raw.is_empty() {
         return None;
@@ -56,14 +62,19 @@ pub fn read_last_command() -> Option<String> {
 }
 
 /// Extract terminal context from the visible grid, with middle-truncation and panic safety.
+///
+/// `records` are the commands the shell integration hook wrote for this session, oldest
+/// first. They are authoritative for command text and exit codes; the grid supplies the
+/// output each command produced. Pass an empty slice when the hook is not installed.
 pub fn extract_context(
     grid: &Grid<Cell>,
     selection: Option<SelectionRange>,
     cwd: &str,
     last_exit_code: Option<i32>,
+    records: &[CommandRecord],
 ) -> TerminalContext {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        extract_context_inner(grid, selection, cwd, last_exit_code)
+        extract_context_inner(grid, selection, cwd, last_exit_code, records)
     }));
 
     result.unwrap_or_default()
@@ -74,6 +85,7 @@ fn extract_context_inner(
     selection: Option<SelectionRange>,
     cwd: &str,
     last_exit_code: Option<i32>,
+    records: &[CommandRecord],
 ) -> TerminalContext {
     let all_lines = collect_visible_lines(grid);
     let visible_text = truncate_lines(&all_lines);
@@ -82,13 +94,37 @@ fn extract_context_inner(
     // use the block command as an improved fallback when the shell hook file is absent.
     let (block_command, last_command_output) = extract_command_block(&all_lines);
 
-    let last_command = read_last_command().unwrap_or_else(|| {
-        if !block_command.is_empty() {
-            block_command
-        } else {
-            extract_last_command(&all_lines)
+    // Reconstruct the session history from the scrollback, which reaches further back
+    // than the viewport and is unaffected by how far the user has scrolled.
+    let recent_lines = collect_recent_lines(grid, HISTORY_SCAN_LINES);
+    let blocks = extract_command_blocks(&recent_lines, HISTORY_MAX_BLOCKS);
+    let (mut command_history, history_source) =
+        session::merge_history(records, &blocks, HISTORY_MAX_ENTRIES);
+
+    // On the grid-only path the newest command's exit code is the one thing the shell
+    // still tells us, via the legacy state file.
+    if let Some(newest) = command_history.last_mut() {
+        if newest.exit_code.is_none() {
+            newest.exit_code = last_exit_code;
         }
+    }
+
+    // A shell record's command text beats every grid heuristic. Without records the
+    // fallback chain is unchanged: the legacy state file, then the grid.
+    let recorded_command = match history_source {
+        HistorySource::ShellHook => command_history
+            .last()
+            .map(|entry| entry.command.clone())
+            .filter(|command| !command.is_empty()),
+        HistorySource::GridOnly | HistorySource::None => None,
+    };
+    let last_command = recorded_command.or_else(read_last_command).unwrap_or_else(|| {
+        if !block_command.is_empty() { block_command } else { extract_last_command(&all_lines) }
     });
+
+    // Prefer the session's own newest exit code over the process-global state file,
+    // which every Learnminal window writes to.
+    let exit_code = command_history.last().and_then(|entry| entry.exit_code).or(last_exit_code);
 
     let selected_text =
         selection.and_then(|range| extract_selection(grid, range).filter(|s| !s.is_empty()));
@@ -98,8 +134,10 @@ fn extract_context_inner(
         selected_text,
         last_command,
         last_command_output,
+        command_history,
+        history_source,
         cwd: cwd.to_owned(),
-        exit_code: last_exit_code,
+        exit_code,
         rows: grid.screen_lines() as u16,
         cols: grid.columns() as u16,
     }
@@ -115,15 +153,32 @@ fn collect_visible_lines(grid: &Grid<Cell>) -> Vec<String> {
         .collect()
 }
 
+/// Inclusive `[top, bottom]` grid-line range covering the last `max_lines` lines.
+///
+/// Buffer-relative, unlike [`collect_visible_lines`]: it always ends at the bottom of the
+/// buffer so scrolling up does not change which commands are recovered.
+fn scan_range(topmost: i32, bottommost: i32, max_lines: usize) -> (i32, i32) {
+    let max = max_lines.max(1) as i64;
+    let start = (bottommost as i64 - max + 1).max(topmost as i64);
+    (start as i32, bottommost)
+}
+
+fn collect_recent_lines(grid: &Grid<Cell>, max_lines: usize) -> Vec<String> {
+    let (start, end) = scan_range(grid.topmost_line().0, grid.bottommost_line().0, max_lines);
+    (start..=end).map(|line| line_to_string(grid, Line(line))).collect()
+}
+
 fn line_to_string(grid: &Grid<Cell>, line: Line) -> String {
-    let mut result = String::new();
+    let mut result = String::with_capacity(grid.columns());
     for col in 0..grid.columns() {
         let cell = &grid[line][Column(col)];
         if !cell.flags().contains(Flags::WIDE_CHAR_SPACER) {
             result.push(cell.c);
         }
     }
-    result.trim_end().to_owned()
+    // Trim in place: this runs once per scanned grid line, up to HISTORY_SCAN_LINES.
+    result.truncate(result.trim_end().len());
+    result
 }
 
 fn truncate_lines(all_lines: &[String]) -> String {
@@ -140,12 +195,8 @@ fn truncate_lines(all_lines: &[String]) -> String {
     truncate_chars(visible_text)
 }
 
-fn truncate_chars(mut text: String) -> String {
-    if text.len() > MAX_CHARS {
-        text.truncate(MAX_CHARS);
-        text.push_str("\n... [char limit reached]");
-    }
-    text
+fn truncate_chars(text: String) -> String {
+    truncate_with_marker(&text, MAX_CHARS, "\n... [char limit reached]")
 }
 
 /// Extract the most recent command and its output from the visible grid.
@@ -155,43 +206,63 @@ fn truncate_chars(mut text: String) -> String {
 /// two prompts. Both strings are empty when fewer than two prompt lines are visible or the
 /// earlier prompt has no command (e.g. user just opened the shell).
 pub fn extract_command_block(lines: &[String]) -> (String, String) {
-    // Collect indices of the bottom two prompt lines (scanning from the bottom up).
-    let mut prompt_rows: Vec<usize> = Vec::new();
+    extract_command_blocks(lines, 1)
+        .pop()
+        .map(|block| (block.command, block.output))
+        .unwrap_or_default()
+}
+
+/// A command and the output it produced, reconstructed from the grid.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GridBlock {
+    pub command: String,
+    pub output: String,
+    /// Index into the scanned line slice of the prompt row the command was typed on.
+    pub prompt_row: usize,
+}
+
+/// Memory-safety cap on a single block's output. Deliberately silent and far above any
+/// model-facing budget: `prompt` owns what the model sees and adds its own markers, so a
+/// marker added here would end up quoted in the middle of the text the prompt keeps.
+const MAX_BLOCK_OUTPUT_CHARS: usize = 3_000;
+
+/// Reconstruct up to `max_blocks` command blocks from `lines`, oldest first.
+///
+/// A block is the text between two consecutive prompt-bearing lines, so the bottommost
+/// prompt acts as a delimiter only — a command the user is still typing is excluded.
+/// Bare prompts (no command after the marker) are delimiters too.
+pub fn extract_command_blocks(lines: &[String], max_blocks: usize) -> Vec<GridBlock> {
+    if max_blocks == 0 {
+        return Vec::new();
+    }
+
+    // Scan bottom-up for prompt rows; N blocks need N + 1 delimiters.
+    let mut prompt_rows: Vec<usize> = Vec::with_capacity(max_blocks + 1);
     for (i, line) in lines.iter().enumerate().rev() {
         if line_has_prompt(line) {
             prompt_rows.push(i);
-            if prompt_rows.len() == 2 {
+            if prompt_rows.len() == max_blocks + 1 {
                 break;
             }
         }
     }
+    prompt_rows.reverse();
 
-    if prompt_rows.len() < 2 {
-        return (String::new(), String::new());
+    let mut blocks = Vec::with_capacity(prompt_rows.len().saturating_sub(1));
+    for pair in prompt_rows.windows(2) {
+        let (cmd_row, next_row) = (pair[0], pair[1]);
+        let command = match command_after_last_prompt(&lines[cmd_row]) {
+            Some(command) if !command.is_empty() => command,
+            _ => continue,
+        };
+
+        let output = lines[cmd_row + 1..next_row].join("\n");
+        let output = truncate_with_marker(output.trim(), MAX_BLOCK_OUTPUT_CHARS, "");
+
+        blocks.push(GridBlock { command, output, prompt_row: cmd_row });
     }
 
-    // prompt_rows[0] = bottommost prompt (current, usually empty)
-    // prompt_rows[1] = previous prompt (where the last command was typed)
-    let current_row = prompt_rows[0];
-    let cmd_row = prompt_rows[1];
-
-    let command = command_after_last_prompt(&lines[cmd_row]).unwrap_or_default();
-    if command.is_empty() {
-        return (String::new(), String::new());
-    }
-
-    let raw_output = lines[cmd_row + 1..current_row].join("\n");
-    let output = raw_output.trim().to_owned();
-
-    // Cap output to stay within the LLM context budget.
-    const MAX_OUTPUT_CHARS: usize = 3_000;
-    let output = if output.len() > MAX_OUTPUT_CHARS {
-        format!("{}\n... [output truncated]", &output[..MAX_OUTPUT_CHARS])
-    } else {
-        output
-    };
-
-    (command, output)
+    blocks
 }
 
 /// Returns `true` if `line` contains a prompt character at a plausible prompt position.
@@ -534,6 +605,97 @@ mod tests {
         assert!(text.len() <= MAX_CHARS + TRUNCATION_SUFFIX_LEN);
     }
 
+    #[test]
+    fn truncate_chars_is_char_boundary_safe() {
+        // Byte-based truncation would slice through a multi-byte character and panic,
+        // which `extract_context`'s catch_unwind would turn into an empty context.
+        let text = truncate_chars("é".repeat(MAX_CHARS + 10));
+        assert!(text.contains("[char limit reached]"));
+        assert_eq!(text.chars().count(), MAX_CHARS + "\n... [char limit reached]".chars().count());
+    }
+
+    #[test]
+    fn command_block_output_truncation_is_char_safe() {
+        let long_output = "日".repeat(4_000);
+        let lines: Vec<String> = vec!["$ cat notes.txt".into(), long_output, "$ ".into()];
+        let (cmd, out) = extract_command_block(&lines);
+        assert_eq!(cmd, "cat notes.txt");
+        // Capped silently: the prompt layer adds the marker the model sees.
+        assert_eq!(out.chars().count(), MAX_BLOCK_OUTPUT_CHARS);
+    }
+
+    // ---- extract_command_blocks tests ----
+
+    fn sample_session() -> Vec<String> {
+        vec![
+            "user@host $ cd /tmp".into(),
+            "user@host $ ls".into(),
+            "a.txt".into(),
+            "b.txt".into(),
+            "user@host $ false".into(),
+            "user@host $ ".into(),
+        ]
+    }
+
+    #[test]
+    fn extract_command_blocks_returns_oldest_to_newest() {
+        let blocks = extract_command_blocks(&sample_session(), 5);
+        let commands: Vec<&str> = blocks.iter().map(|b| b.command.as_str()).collect();
+        assert_eq!(commands, ["cd /tmp", "ls", "false"]);
+        assert!(blocks[0].output.is_empty());
+        assert_eq!(blocks[1].output, "a.txt\nb.txt");
+    }
+
+    #[test]
+    fn extract_command_blocks_respects_max_blocks() {
+        let blocks = extract_command_blocks(&sample_session(), 2);
+        let commands: Vec<&str> = blocks.iter().map(|b| b.command.as_str()).collect();
+        assert_eq!(commands, ["ls", "false"], "the newest blocks must be the ones kept");
+
+        assert!(extract_command_blocks(&sample_session(), 0).is_empty());
+    }
+
+    #[test]
+    fn extract_command_blocks_skips_bare_prompt_rows() {
+        let lines: Vec<String> = vec![
+            "user@host $ ".into(),
+            "user@host $ echo hi".into(),
+            "hi".into(),
+            "user@host $ ".into(),
+        ];
+        let blocks = extract_command_blocks(&lines, 5);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].command, "echo hi");
+    }
+
+    #[test]
+    fn extract_command_block_wrapper_matches_legacy_behaviour() {
+        // The single-block wrapper must keep returning exactly what the old bottom-two-
+        // prompts scan did, since `last_command` still falls back to it.
+        assert_eq!(extract_command_block(&sample_session()), ("false".to_owned(), String::new()));
+        assert_eq!(extract_command_block(&[]), (String::new(), String::new()));
+
+        // Bare prompt directly above the current one: no command, so no block.
+        let bare: Vec<String> = vec!["user@host $ ".into(), "user@host $ ".into()];
+        assert_eq!(extract_command_block(&bare), (String::new(), String::new()));
+    }
+
+    // ---- scan_range tests ----
+
+    #[test]
+    fn scan_range_clamps_to_topmost() {
+        assert_eq!(scan_range(-10, 23, 500), (-10, 23));
+        assert_eq!(scan_range(-10_000, 23, 500), (-476, 23));
+    }
+
+    #[test]
+    fn scan_range_handles_empty_history_and_degenerate_limits() {
+        assert_eq!(scan_range(0, 23, 500), (0, 23));
+        assert_eq!(scan_range(-100, 23, 1), (23, 23));
+        // A zero limit would produce an inverted range; clamp it to a single line.
+        assert_eq!(scan_range(-100, 23, 0), (23, 23));
+    }
+
     // ---- Property tests (Task 2.2) ----
 
     fn prompt_char_strategy() -> impl Strategy<Value = char> {
@@ -620,6 +782,38 @@ mod tests {
                 prop_assume!(!line.chars().any(|c| PROMPT_CHARS.contains(&c)));
             }
             prop_assert!(extract_last_command(&lines).is_empty());
+        }
+
+        // Multi-block extraction must survive arbitrary screen content: it runs on
+        // scrollback, which contains anything the user ever ran.
+        #[test]
+        fn extract_command_blocks_is_bounded_and_well_formed(
+            lines in prop::collection::vec(".*", 0..80),
+            max_blocks in 0usize..10,
+        ) {
+            let blocks = extract_command_blocks(&lines, max_blocks);
+            prop_assert!(blocks.len() <= max_blocks);
+            for pair in blocks.windows(2) {
+                prop_assert!(pair[0].prompt_row < pair[1].prompt_row, "blocks must be ordered");
+            }
+            for block in &blocks {
+                prop_assert!(!block.command.is_empty(), "bare prompts are delimiters only");
+                prop_assert!(block.prompt_row < lines.len());
+            }
+        }
+
+        // The single-block wrapper is the fallback for `last_command`; it must stay
+        // equivalent to asking for the newest of many blocks.
+        #[test]
+        fn extract_command_block_agrees_with_multi_block(
+            lines in prop::collection::vec(".*", 0..40),
+        ) {
+            let single = extract_command_block(&lines);
+            let newest = extract_command_blocks(&lines, 1)
+                .pop()
+                .map(|b| (b.command, b.output))
+                .unwrap_or_default();
+            prop_assert_eq!(single, newest);
         }
     }
 }

@@ -8,12 +8,15 @@ use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::config::UiConfig;
-use crate::display::color::Rgb;
 use crate::display::SizeInfo;
 use crate::learnminal::actions::{ActionItem, MAX_ACTIONS};
 use crate::learnminal::ollama::{self, ChatTurn};
 use crate::learnminal::settings::{ExperienceLevel, InspectMode};
 use crate::learnminal::types::SystemInfo;
+use crate::display::color::Rgb;
+use crate::learnminal::session;
+use crate::learnminal::settings::{ExperienceLevel, SETTINGS_DIR_NAME};
+use crate::learnminal::types::{CommandEntry, HistorySource, SystemInfo};
 use crate::renderer::rects::RenderRect;
 
 const BATCH_INTERVAL: Duration = Duration::from_millis(16);
@@ -41,6 +44,14 @@ const MSG_TIMEOUT: &str =
     "Response timed out. The model may be overloaded. Try a shorter selection.";
 const MSG_EMPTY_CONTEXT: &str = "Could not read terminal content. Try selecting text manually.";
 
+/// Shell rc line that enables the command-history hook, shown by `/history`.
+///
+/// Built from the constants `session` publishes the scripts under, so a rename there
+/// cannot leave this pointing at a file that does not exist.
+fn history_install_hint(script: &str, rc_file: &str) -> String {
+    format!("source ~/{SETTINGS_DIR_NAME}/{}/{script}   # {rc_file}", session::SHELL_DIR_NAME)
+}
+
 /// Overlay error panels auto-dismiss after this duration (Req 11 extension).
 pub const ERROR_AUTO_DISMISS_SECS: u64 = 8;
 
@@ -56,6 +67,8 @@ pub enum SlashCommand {
     Level { level: Option<ExperienceLevel>, list: bool },
     /// Show or set how visible the read-only inspection tool is.
     Inspect { mode: Option<InspectMode>, list: bool },
+    /// Show the recent commands the AI can see (handled locally).
+    History,
     /// List available slash commands (handled locally).
     Help,
     /// Clear the Chat mode transcript (handled locally).
@@ -82,6 +95,7 @@ impl SlashCommand {
                 let refresh = words.any(|w| w.eq_ignore_ascii_case("refresh"));
                 Some(Ok(Self::Info { refresh }))
             },
+            "history" => Some(Ok(Self::History)),
             "model" => {
                 let list = words.any(|w| w.eq_ignore_ascii_case("list"));
                 let name = words.find(|w| !w.eq_ignore_ascii_case("list")).map(str::to_owned);
@@ -752,6 +766,7 @@ impl OverlayPanel {
                 "/journal — list programs with saved notes".into(),
                 "/journal <program> — show recent notes for a program".into(),
                 "/journal clear <program> — delete notes for a program".into(),
+                "/history — show the recent commands the AI can see".into(),
                 "/clear — clear the Chat transcript".into(),
                 "/actions — list the commands in the Actions panel".into(),
                 "/actions clear — dismiss the Actions panel".into(),
@@ -788,14 +803,66 @@ impl OverlayPanel {
             })
             .collect();
         self.show_slash_message("Actions", &lines);
+    /// Show the session command history exactly as the model receives it.
+    pub fn show_command_history(&mut self, entries: &[CommandEntry], source: HistorySource) {
+        let mut lines: Vec<String> = Vec::new();
+
+        if entries.is_empty() {
+            lines.push("No recent commands recovered from this session.".into());
+        } else {
+            for entry in entries {
+                let exit = match entry.exit_code {
+                    Some(code) => format!("exit {code}"),
+                    None => "exit unknown".into(),
+                };
+                let output_lines = entry.output.lines().filter(|l| !l.trim().is_empty()).count();
+                let output = match output_lines {
+                    0 => "no output captured".to_owned(),
+                    1 => "1 line of output".to_owned(),
+                    n => format!("{n} lines of output"),
+                };
+                lines.push(format!("$ {}", entry.command));
+                lines.push(format!("    {exit} — {output}"));
+            }
+            lines.push(String::new());
+        }
+
+        match source {
+            HistorySource::ShellHook => {
+                lines.push("Source: shell hook — commands and exit codes are exact.".into());
+            },
+            HistorySource::GridOnly | HistorySource::None => {
+                lines.push("Source: screen only — exit codes and older commands are".into());
+                lines
+                    .push("unavailable. To enable full history, add this to your shell rc:".into());
+                lines.push(String::new());
+                lines.push(history_install_hint(session::ZSH_SCRIPT_NAME, "~/.zshrc"));
+                lines.push(history_install_hint(session::BASH_SCRIPT_NAME, "~/.bashrc"));
+                lines.push(String::new());
+                lines.push("then open a new Learnminal window.".into());
+            },
+        }
+
+        self.show_slash_message("Recent commands", &lines);
     }
 
     /// Display system environment from `GET /system-info`.
-    pub fn show_system_info(&mut self, info: &SystemInfo) {
+    ///
+    /// `shell_integration` reports whether this session's command-history hook is
+    /// recording — `/info` is where users look to find out what the agent knows.
+    pub fn show_system_info(&mut self, info: &SystemInfo, shell_integration: bool) {
         let mut lines = vec![
             format!("OS: {}", info.os),
             format!("Architecture: {}", info.arch),
             format!("Shell: {}", info.shell),
+            format!(
+                "Shell integration: {}",
+                if shell_integration {
+                    "active (command history recorded)"
+                } else {
+                    "not installed (see /history)"
+                }
+            ),
         ];
         if info.package_managers.is_empty() {
             lines.push("Package managers: none detected".into());
@@ -1087,6 +1154,8 @@ impl OverlayPanel {
                         Ok(cmd @ SlashCommand::Inspect { .. }) => {
                             OverlayAction::RunSlashCommand(cmd)
                         },
+                        // Needs the terminal grid, which only the event loop can reach.
+                        Ok(cmd @ SlashCommand::History) => OverlayAction::RunSlashCommand(cmd),
                         Err(message) => {
                             self.show_slash_message("Command error", &[message]);
                             OverlayAction::None
@@ -2369,6 +2438,56 @@ mod tests {
         );
         assert!(SlashCommand::parse("/inspect loud").unwrap().is_err());
         assert!(SlashCommand::parse("/inspect list off").unwrap().is_err());
+    fn slash_command_parse_history() {
+        assert_eq!(SlashCommand::parse("/history").unwrap().unwrap(), SlashCommand::History);
+        assert_eq!(SlashCommand::parse("/HISTORY").unwrap().unwrap(), SlashCommand::History);
+        assert_eq!(SlashCommand::parse("/history extra").unwrap().unwrap(), SlashCommand::History);
+    }
+
+    #[test]
+    fn slash_help_lists_history() {
+        let mut panel = OverlayPanel::new();
+        panel.show_slash_help();
+        assert!(panel.view_lines().iter().any(|line| line.text.contains("/history")));
+    }
+
+    #[test]
+    fn command_history_view_reports_exit_codes_and_output_size() {
+        let mut panel = OverlayPanel::new();
+        let entries = [
+            CommandEntry {
+                command: "ls".into(),
+                exit_code: Some(0),
+                output: "a.txt\nb.txt".into(),
+                cwd: String::new(),
+            },
+            CommandEntry {
+                command: "false".into(),
+                exit_code: Some(1),
+                output: String::new(),
+                cwd: String::new(),
+            },
+        ];
+        panel.show_command_history(&entries, HistorySource::ShellHook);
+
+        let text: String =
+            panel.view_lines().iter().map(|line| line.text.clone()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("$ ls"));
+        assert!(text.contains("exit 0 — 2 lines of output"));
+        assert!(text.contains("exit 1 — no output captured"));
+        assert!(text.contains("Source: shell hook"));
+    }
+
+    #[test]
+    fn command_history_view_explains_how_to_install_the_hook() {
+        let mut panel = OverlayPanel::new();
+        panel.show_command_history(&[], HistorySource::None);
+
+        let text: String =
+            panel.view_lines().iter().map(|line| line.text.clone()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("No recent commands"));
+        assert!(text.contains("learnminal.zsh"));
+        assert!(text.contains("learnminal.bash"));
     }
 
     #[test]

@@ -167,12 +167,29 @@ impl FromStr for ExperienceLevel {
     }
 }
 
-fn settings_dir() -> Option<PathBuf> {
+/// `~/.ai-cli-learning`, or `None` when the home directory cannot be resolved.
+///
+/// Every Learnminal runtime file (settings, journal, sessions, shell scripts) hangs
+/// off this directory; resolve it here rather than re-deriving it per module.
+pub fn state_dir() -> Option<PathBuf> {
     home::home_dir().map(|home| home.join(SETTINGS_DIR_NAME))
 }
 
 fn settings_path() -> Option<PathBuf> {
-    settings_dir().map(|dir| dir.join(SETTINGS_FILE_NAME))
+    state_dir().map(|dir| dir.join(SETTINGS_FILE_NAME))
+}
+
+/// Write `bytes` to `path` atomically, via a temp file in `dir` and a rename.
+///
+/// The temp file must live in the destination's own directory: a rename across
+/// filesystems is not atomic, and `~` may well be a different mount than `/tmp`.
+pub fn atomic_write(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut tmp = tempfile::Builder::new().prefix(".learnminal").suffix(".tmp").tempfile_in(dir)?;
+    tmp.as_file_mut().write_all(bytes)?;
+    tmp.persist(path).map_err(|err| err.error)?;
+    Ok(())
 }
 
 /// Preferred Ollama model from settings, if any.
@@ -182,7 +199,7 @@ pub fn get_preferred_model() -> Option<String> {
 
 /// Persist the preferred Ollama model.
 pub fn set_preferred_model(model: &str) -> io::Result<()> {
-    let dir = settings_dir()
+    let dir = state_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     write_preferred_model(&dir, model)
 }
@@ -196,7 +213,7 @@ pub fn get_experience_level() -> ExperienceLevel {
 
 /// Persist the experience level.
 pub fn set_experience_level(level: ExperienceLevel) -> io::Result<()> {
-    let dir = settings_dir()
+    let dir = state_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     write_experience_level(&dir, level)
 }
@@ -268,13 +285,9 @@ fn write_setting(dir: &Path, key: &str, value: Value) -> io::Result<()> {
         .unwrap_or_default();
     settings.insert(key.to_owned(), value);
 
-    // Atomic write: serialize to a temp file in the same dir, then rename.
-    let mut tmp = tempfile::Builder::new().prefix(".settings").suffix(".tmp").tempfile_in(dir)?;
-    serde_json::to_writer_pretty(&mut tmp, &settings)?;
-    use std::io::Write;
-    tmp.as_file_mut().write_all(b"\n")?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    Ok(())
+    let mut bytes = serde_json::to_vec_pretty(&settings)?;
+    bytes.push(b'\n');
+    atomic_write(dir, &path, &bytes)
 }
 
 #[cfg(test)]

@@ -38,6 +38,7 @@ use crate::display::window::Window;
 use crate::event::{
     ActionContext, Event, EventProxy, InlineSearchState, Mouse, SearchState, TouchPurpose,
 };
+use crate::learnminal::session::Session as LearnminalSession;
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
@@ -61,6 +62,8 @@ pub struct WindowContext {
     touch: TouchPurpose,
     occluded: bool,
     preserve_title: bool,
+    /// Identity of this window's shell session, used to look up its command history.
+    learnminal_session: LearnminalSession,
     #[cfg(not(windows))]
     master_fd: RawFd,
     #[cfg(not(windows))]
@@ -175,6 +178,14 @@ impl WindowContext {
         let mut pty_config = config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
 
+        // Learnminal: give this PTY its own identity so the shell integration hook can
+        // record a command history for it alone. `or_insert` lets a user override (or
+        // blank out) any of these through `env` in alacritty.toml.
+        let learnminal_session = LearnminalSession::new();
+        for (key, value) in learnminal_session.env_vars() {
+            pty_config.env.entry(key).or_insert(value);
+        }
+
         let preserve_title = options.window_identity.title.is_some();
 
         info!(
@@ -226,6 +237,15 @@ impl WindowContext {
         // Kick off the I/O thread.
         let _io_thread = event_loop.spawn();
 
+        // Learnminal: publish the shell integration scripts and sweep away the session
+        // files of terminals that are long gone. Both touch the disk, so keep them off
+        // the UI thread.
+        let session_path = learnminal_session.path().map(ToOwned::to_owned);
+        alacritty_terminal::thread::spawn_named("learnminal session-gc", move || {
+            crate::learnminal::session::ensure_shell_scripts();
+            crate::learnminal::session::cleanup_stale_sessions(session_path.as_deref());
+        });
+
         // Start cursor blinking, in case `Focused` isn't sent on startup.
         if config.cursor.style().blinking {
             event_proxy.send_event(TerminalEvent::CursorBlinkingChange.into());
@@ -234,6 +254,7 @@ impl WindowContext {
         // Create context for the Alacritty window.
         Ok(WindowContext {
             preserve_title,
+            learnminal_session,
             terminal,
             display,
             #[cfg(not(windows))]
@@ -440,6 +461,7 @@ impl WindowContext {
             dirty: &mut self.dirty,
             occluded: &mut self.occluded,
             terminal: &mut terminal,
+            learnminal_session: &self.learnminal_session,
             #[cfg(not(windows))]
             master_fd: self.master_fd,
             #[cfg(not(windows))]

@@ -13,6 +13,7 @@ target/
 
 # Local logs and data (runtime)
 .ai-cli-learning/
+CLAUDE.md
 
 # Planning docs (local only)
 planning/

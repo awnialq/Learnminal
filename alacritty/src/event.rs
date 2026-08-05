@@ -58,6 +58,7 @@ use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
+use crate::learnminal::grid_extractor::HISTORY_MAX_BLOCKS;
 use crate::learnminal::journal;
 use crate::learnminal::manpage::{reference_context, DEFAULT_CONTEXT_BUDGET};
 use crate::learnminal::ollama::ToolSet;
@@ -792,6 +793,8 @@ pub struct ActionContext<'a, N, T> {
     pub dirty: &'a mut bool,
     pub occluded: &'a mut bool,
     pub preserve_title: bool,
+    /// Identity of this window's shell session, used to look up its command history.
+    pub learnminal_session: &'a crate::learnminal::session::Session,
     #[cfg(not(windows))]
     pub master_fd: RawFd,
     #[cfg(not(windows))]
@@ -1108,6 +1111,16 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             },
             // Handled entirely inside the overlay's key dispatch.
             SlashCommand::Help | SlashCommand::Clear | SlashCommand::Actions { .. } => {},
+            SlashCommand::History => {
+                info!("Learnminal: /history slash command");
+                self.display.learnminal_overlay.begin_slash_command("/history");
+                // Same cost as opening the overlay, so no background thread.
+                let ctx = self.current_terminal_context();
+                self.display
+                    .learnminal_overlay
+                    .show_command_history(&ctx.command_history, ctx.history_source);
+            },
+            SlashCommand::Help | SlashCommand::Clear => {},
         }
         self.request_redraw();
     }
@@ -1746,7 +1759,11 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         #[cfg(windows)]
         let cwd = String::new();
 
-        extract_context(self.terminal.grid(), selection, &cwd, read_last_exit_code())
+        // Records are authoritative for the commands and their exit codes; the grid
+        // supplies the output each one produced.
+        let records = self.learnminal_session.recent_commands(HISTORY_MAX_BLOCKS);
+
+        extract_context(self.terminal.grid(), selection, &cwd, read_last_exit_code(), &records)
     }
 
     fn spawn_learnminal_system_info(&self, _refresh: bool) {
@@ -2604,7 +2621,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                                 .learnminal_overlay
                                 .is_stale_request(generation) =>
                         {
-                            self.ctx.display.learnminal_overlay.show_system_info(&info);
+                            let shell_integration = self.ctx.learnminal_session.is_active();
+                            self.ctx
+                                .display
+                                .learnminal_overlay
+                                .show_system_info(&info, shell_integration);
                         },
                         LearnminalEvent::DismissError => {
                             self.ctx.display.learnminal_overlay.dismiss_error();
