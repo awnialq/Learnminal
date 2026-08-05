@@ -11,7 +11,8 @@ use crate::config::UiConfig;
 use crate::display::color::Rgb;
 use crate::display::SizeInfo;
 use crate::learnminal::actions::{ActionItem, MAX_ACTIONS};
-use crate::learnminal::settings::ExperienceLevel;
+use crate::learnminal::ollama::{self, ChatTurn};
+use crate::learnminal::settings::{ExperienceLevel, InspectMode};
 use crate::learnminal::types::SystemInfo;
 use crate::renderer::rects::RenderRect;
 
@@ -53,6 +54,8 @@ pub enum SlashCommand {
     Journal { program: Option<String>, clear: bool },
     /// List or switch the user experience level.
     Level { level: Option<ExperienceLevel>, list: bool },
+    /// Show or set how visible the read-only inspection tool is.
+    Inspect { mode: Option<InspectMode>, list: bool },
     /// List available slash commands (handled locally).
     Help,
     /// Clear the Chat mode transcript (handled locally).
@@ -116,6 +119,28 @@ impl SlashCommand {
                         Ok(level) => Some(Ok(Self::Level { level: Some(level), list: false })),
                         Err(()) => Some(Err(format!(
                             "Unknown level '{raw}'. Use beginner, novice, professional, or expert."
+                        ))),
+                    },
+                }
+            },
+            "inspect" => {
+                let mut args: Vec<&str> = words.collect();
+                let list = args.first().is_some_and(|w| w.eq_ignore_ascii_case("list"));
+                if list {
+                    args.remove(0);
+                }
+                let mode_arg = args.first().copied();
+                if list && mode_arg.is_some() {
+                    return Some(Err(
+                        "Usage: /inspect [list|off|quiet|status|verbose]".into(),
+                    ));
+                }
+                match mode_arg {
+                    None => Some(Ok(Self::Inspect { mode: None, list: true })),
+                    Some(raw) => match raw.parse::<InspectMode>() {
+                        Ok(mode) => Some(Ok(Self::Inspect { mode: Some(mode), list: false })),
+                        Err(()) => Some(Err(format!(
+                            "Unknown inspect mode '{raw}'. Use off, quiet, status, or verbose."
                         ))),
                     },
                 }
@@ -245,6 +270,10 @@ pub struct OverlayPanel {
     actions_pending: bool,
     /// Set by `/actions clear`; cleared when a new question is asked.
     actions_dismissed: bool,
+    /// Completed question/answer pairs, replayed so follow-ups resolve.
+    history: Vec<ChatTurn>,
+    /// The question awaiting its reply, paired on `ChatDone`.
+    pending_user: Option<String>,
 }
 
 impl Default for OverlayPanel {
@@ -282,6 +311,8 @@ impl OverlayPanel {
             actions: Vec::new(),
             actions_pending: false,
             actions_dismissed: false,
+            history: Vec::new(),
+            pending_user: None,
         }
     }
 
@@ -559,7 +590,41 @@ impl OverlayPanel {
     }
 
     /// Clear Chat mode content.
+    /// Prior turns for the model, oldest first.
+    pub fn history_messages(&self) -> Vec<serde_json::Value> {
+        ollama::history_messages(&self.history)
+    }
+
+    /// Pair the finished reply with the question that produced it.
+    ///
+    /// Called only from the `ChatDone` handler, which is already guarded
+    /// against stale generations, so a cancelled or superseded request never
+    /// enters the history.
+    pub fn record_turn(&mut self, assistant: &str) {
+        let Some(user) = self.pending_user.take() else {
+            return;
+        };
+        if user.trim().is_empty() || assistant.trim().is_empty() {
+            return;
+        }
+        self.history.push(ChatTurn { user, assistant: assistant.to_owned() });
+        let overflow = self.history.len().saturating_sub(ollama::MAX_HISTORY_TURNS);
+        if overflow > 0 {
+            self.history.drain(..overflow);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
     pub fn clear_chat_output(&mut self) {
+        // `/clear` resets the conversation, not just what is on screen —
+        // otherwise the model keeps answering from turns the user can no
+        // longer see.
+        self.history.clear();
+        self.pending_user = None;
         self.chat_lines.clear();
         self.chat_active = false;
         self.chat_stream_line = None;
@@ -575,6 +640,8 @@ impl OverlayPanel {
 
     /// Prepare Chat mode for a user question.
     pub fn begin_chat_message(&mut self, query: &str) {
+        // Held until the reply lands, then paired with it in `record_turn`.
+        self.pending_user = Some(query.to_owned());
         self.interaction_mode = InteractionMode::Chat;
         self.chat_active = true;
         self.chat_stream_line = None;
@@ -680,6 +747,8 @@ impl OverlayPanel {
                 "/model <name> — switch active model".into(),
                 "/level — show experience levels".into(),
                 "/level <beginner|novice|professional|expert> — set experience level".into(),
+                "/inspect — show environment inspection visibility".into(),
+                "/inspect <off|quiet|status|verbose> — set inspection visibility".into(),
                 "/journal — list programs with saved notes".into(),
                 "/journal <program> — show recent notes for a program".into(),
                 "/journal clear <program> — delete notes for a program".into(),
@@ -824,6 +893,44 @@ impl OverlayPanel {
                 "Future chat replies will match this experience level.".into(),
             ],
         );
+    }
+
+    /// Display inspection visibility modes and the active one.
+    pub fn show_inspect_modes(&mut self, current: InspectMode) {
+        let mut lines = vec![format!("Active mode: {}", current.label())];
+        lines.push("Available modes:".into());
+        for mode in InspectMode::ALL {
+            let marker = if mode == current { " (active)" } else { "" };
+            lines.push(format!("  {} — {}{marker}", mode.as_str(), mode.description()));
+        }
+        lines.push("".into());
+        lines.push("The assistant may only read: no writes, installs, or network access.".into());
+        lines.push("Switch with: /inspect <off|quiet|status|verbose>".into());
+        self.show_slash_message("Environment inspection", &lines);
+    }
+
+    /// Confirm an inspection visibility switch.
+    pub fn show_inspect_mode_selected(&mut self, mode: InspectMode) {
+        let mut lines = vec![
+            format!("Inspection is now: {}", mode.label()),
+            format!("({}.)", mode.description()),
+        ];
+        if mode == InspectMode::Off {
+            lines.push("The assistant will answer from terminal context alone.".into());
+        }
+        self.show_slash_message("Environment inspection updated", &lines);
+    }
+
+    /// Record a command the assistant ran, for [`InspectMode::Verbose`].
+    pub fn append_tool_line(&mut self, command: &str) {
+        self.remove_loading_lines();
+        self.has_chunks = true;
+        let lines = self.view_lines_mut();
+        lines.push(DisplayLine {
+            text: format!("  › ran: {command}"),
+            style: LineStyle::Muted,
+        });
+        self.needs_redraw = true;
     }
 
     pub fn show_slash_message(&mut self, title: &str, body_lines: &[String]) {
@@ -977,6 +1084,9 @@ impl OverlayPanel {
                             OverlayAction::RunSlashCommand(cmd)
                         },
                         Ok(cmd @ SlashCommand::Level { .. }) => OverlayAction::RunSlashCommand(cmd),
+                        Ok(cmd @ SlashCommand::Inspect { .. }) => {
+                            OverlayAction::RunSlashCommand(cmd)
+                        },
                         Err(message) => {
                             self.show_slash_message("Command error", &[message]);
                             OverlayAction::None
@@ -2032,6 +2142,54 @@ mod tests {
     }
 
     #[test]
+    fn records_a_turn_and_replays_it() {
+        let mut panel = OverlayPanel::new();
+        panel.begin_chat_message("where are my movies?");
+        panel.record_turn("In ~/Videos.");
+        assert_eq!(panel.history_len(), 1);
+
+        let msgs = panel.history_messages();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "where are my movies?");
+        assert_eq!(msgs[1]["content"], "In ~/Videos.");
+    }
+
+    #[test]
+    fn a_reply_without_a_question_is_not_recorded() {
+        let mut panel = OverlayPanel::new();
+        // No begin_chat_message, so there is nothing to pair with.
+        panel.record_turn("orphan reply");
+        assert_eq!(panel.history_len(), 0);
+        // And a question is consumed only once.
+        panel.begin_chat_message("q");
+        panel.record_turn("a");
+        panel.record_turn("a second reply for the same question");
+        assert_eq!(panel.history_len(), 1);
+    }
+
+    #[test]
+    fn history_is_capped_at_the_turn_limit() {
+        let mut panel = OverlayPanel::new();
+        for i in 0..(crate::learnminal::ollama::MAX_HISTORY_TURNS + 3) {
+            panel.begin_chat_message(&format!("q{i}"));
+            panel.record_turn(&format!("a{i}"));
+        }
+        assert_eq!(panel.history_len(), crate::learnminal::ollama::MAX_HISTORY_TURNS);
+    }
+
+    #[test]
+    fn clear_resets_the_conversation_not_just_the_screen() {
+        let mut panel = OverlayPanel::new();
+        panel.begin_chat_message("q");
+        panel.record_turn("a");
+        assert_eq!(panel.history_len(), 1);
+
+        panel.clear_chat_output();
+        assert_eq!(panel.history_len(), 0);
+        assert!(panel.history_messages().is_empty());
+    }
+
+    #[test]
     fn begin_chat_message_sticks_to_bottom() {
         let mut panel = OverlayPanel::new();
         panel.show();
@@ -2189,6 +2347,28 @@ mod tests {
     #[test]
     fn slash_command_parse_clear() {
         assert_eq!(SlashCommand::parse("/clear").unwrap().unwrap(), SlashCommand::Clear);
+    }
+
+    #[test]
+    fn slash_command_parse_inspect() {
+        assert_eq!(
+            SlashCommand::parse("/inspect").unwrap().unwrap(),
+            SlashCommand::Inspect { mode: None, list: true }
+        );
+        assert_eq!(
+            SlashCommand::parse("/inspect list").unwrap().unwrap(),
+            SlashCommand::Inspect { mode: None, list: true }
+        );
+        assert_eq!(
+            SlashCommand::parse("/inspect off").unwrap().unwrap(),
+            SlashCommand::Inspect { mode: Some(InspectMode::Off), list: false }
+        );
+        assert_eq!(
+            SlashCommand::parse("/inspect Verbose").unwrap().unwrap(),
+            SlashCommand::Inspect { mode: Some(InspectMode::Verbose), list: false }
+        );
+        assert!(SlashCommand::parse("/inspect loud").unwrap().is_err());
+        assert!(SlashCommand::parse("/inspect list off").unwrap().is_err());
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -36,7 +37,99 @@ const UNLOAD_TIMEOUT_SECS: u64 = 5;
 /// Keep the model resident until an explicit unload (`keep_alive: 0`).
 const KEEP_ALIVE_FOREVER: i64 = -1;
 /// Max non-streaming tool rounds before forcing a final streamed answer.
-const MAX_TOOL_ROUNDS: usize = 2;
+///
+/// Environment inspection is sequential (`pwd` → `ls` → `cat`), and searching
+/// for something whose location is unknown takes several more probes, so this
+/// sits above the length of a real investigation rather than below it.
+const MAX_TOOL_ROUNDS: usize = 8;
+
+/// Prior turns replayed so a follow-up question makes sense.
+///
+/// Each request is otherwise stateless — the daemon keeps no session — so
+/// without this the model cannot resolve "how big was it?" against anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTurn {
+    /// The user's raw question, not the assembled prompt.
+    pub user: String,
+    pub assistant: String,
+}
+
+/// Turns kept for replay. Enough for a short exchange, bounded so the model's
+/// context is not consumed by history instead of the actual question.
+pub const MAX_HISTORY_TURNS: usize = 4;
+/// Total character budget for replayed history.
+const HISTORY_BUDGET_CHARS: usize = 2_000;
+/// Per-reply cap, so one long answer cannot crowd out earlier turns.
+const HISTORY_REPLY_CHARS: usize = 500;
+
+/// Render prior turns as chat messages, newest first within the budget.
+///
+/// Only the raw question is replayed, never the assembled prompt: the system
+/// instructions, terminal context, and Reference block belong to the current
+/// turn alone and would multiply if every turn carried its own copy.
+pub fn history_messages(turns: &[ChatTurn]) -> Vec<Value> {
+    let mut kept: Vec<&ChatTurn> = Vec::new();
+    let mut used = 0usize;
+
+    // Walk backwards so the most recent turns win the budget.
+    for turn in turns.iter().rev().take(MAX_HISTORY_TURNS) {
+        let reply = truncate_chars(&turn.assistant, HISTORY_REPLY_CHARS);
+        let cost = turn.user.chars().count() + reply.chars().count();
+        if used + cost > HISTORY_BUDGET_CHARS && !kept.is_empty() {
+            break;
+        }
+        used += cost;
+        kept.push(turn);
+    }
+
+    kept.reverse();
+    let mut messages = Vec::with_capacity(kept.len() * 2);
+    for turn in kept {
+        messages.push(json!({ "role": "user", "content": turn.user }));
+        messages.push(json!({
+            "role": "assistant",
+            "content": truncate_chars(&turn.assistant, HISTORY_REPLY_CHARS),
+        }));
+    }
+    messages
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{}…", kept.trim_end())
+}
+
+/// Tools offered to the model for one request.
+///
+/// Enablement and scope travel together: `read_exec` carries the directory the
+/// `run_command` tool is confined to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolSet {
+    pub web_search: bool,
+    /// `Some(root)` enables `run_command`, restricted to that directory.
+    pub read_exec: Option<PathBuf>,
+}
+
+impl ToolSet {
+    /// Whether no tool is available, in which case the plain stream is used.
+    pub fn is_empty(&self) -> bool {
+        !self.web_search && self.read_exec.is_none()
+    }
+
+    fn schemas(&self) -> Vec<Value> {
+        let mut tools = Vec::new();
+        if self.web_search {
+            tools.push(web_search_tool_schema());
+        }
+        if self.read_exec.is_some() {
+            tools.push(run_command_tool_schema());
+        }
+        tools
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OllamaError {
@@ -210,27 +303,31 @@ impl OllamaClient {
         Ok(())
     }
 
-    /// Chat with optional `web_search` tool-calling, then stream the final answer.
+    /// Chat with optional tool-calling, then stream the final answer.
     ///
     /// Tool rounds are non-streaming (max [`MAX_TOOL_ROUNDS`]). The final turn
     /// streams tokens via `on_chunk` / `on_done`. `on_status` reports progress
-    /// such as "Searching the web…".
+    /// such as "Searching the web…" or "Running: git status".
     pub fn chat_with_tools_loop(
         &self,
         model: &str,
         prompt: &str,
-        enable_web_search: bool,
+        history: &[Value],
+        tool_set: &ToolSet,
         mut on_status: impl FnMut(&str),
         mut on_chunk: impl FnMut(String),
         mut on_done: impl FnMut(String),
         mut on_error: impl FnMut(String),
     ) -> Result<(), OllamaError> {
-        if !enable_web_search {
-            return self.chat_stream(model, prompt, on_chunk, on_done, on_error);
+        // Prior turns first, then this turn's fully assembled prompt.
+        let mut messages = history.to_vec();
+        messages.push(json!({ "role": "user", "content": prompt }));
+
+        if tool_set.is_empty() {
+            return self.chat_stream_messages(model, &messages, on_chunk, on_done, on_error);
         }
 
-        let mut messages = vec![json!({ "role": "user", "content": prompt })];
-        let tools = vec![web_search_tool_schema()];
+        let tools = tool_set.schemas();
 
         for _round in 0..MAX_TOOL_ROUNDS {
             let response = self.chat_once(model, &messages, Some(&tools))?;
@@ -256,16 +353,23 @@ impl OllamaClient {
             messages.push(message);
 
             for call in tool_calls {
-                if call.name != "web_search" {
-                    messages.push(json!({
-                        "role": "tool",
-                        "content": format!("unknown tool: {}", call.name),
-                    }));
-                    continue;
-                }
-                on_status("Searching the web…");
-                let query = call.query.unwrap_or_default();
-                let result = crate::learnminal::web_search::search_tool_result(&query);
+                let result = match call.name.as_str() {
+                    "web_search" if tool_set.web_search => {
+                        on_status("Searching the web…");
+                        let query = call.string_arg("query").unwrap_or_default();
+                        crate::learnminal::web_search::search_tool_result(&query)
+                    },
+                    "run_command" if tool_set.read_exec.is_some() => {
+                        let command = call.string_arg("command").unwrap_or_default();
+                        on_status(&format!(
+                            "{}{command}",
+                            crate::learnminal::read_exec::RUNNING_STATUS_PREFIX
+                        ));
+                        let root = tool_set.read_exec.as_deref().expect("checked above");
+                        crate::learnminal::read_exec::run_command_tool_result(&command, root)
+                    },
+                    other => format!("unknown tool: {other}"),
+                };
                 messages.push(json!({
                     "role": "tool",
                     "content": result,
@@ -472,6 +576,30 @@ fn web_search_tool_schema() -> Value {
     })
 }
 
+fn run_command_tool_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a single read-only shell command to inspect the user's machine \
+                            (files, git state, installed versions, environment). Only inspection \
+                            commands are permitted; anything that writes, deletes, installs, or \
+                            connects to the network is refused. No pipes, redirects, or command \
+                            chaining — run one command per call.",
+            "parameters": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "One command with its arguments, e.g. \"git status --short\" or \"ls -la src\""
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Tool the model calls to register the runnable commands from its own answer.
 pub fn actions_tool_schema() -> Value {
     json!({
@@ -556,7 +684,16 @@ pub fn parse_embedded_json(text: &str) -> Option<Value> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedToolCall {
     name: String,
-    query: Option<String>,
+    /// Raw `arguments`, kept untyped so each tool reads its own keys.
+    args: Value,
+}
+
+impl ParsedToolCall {
+    /// String argument `key`, tolerating an object, JSON in a string, or a
+    /// bare string (which small models emit for single-argument tools).
+    fn string_arg(&self, key: &str) -> Option<String> {
+        string_arg_from(&self.args, key)
+    }
 }
 
 fn message_content(message: &Value) -> String {
@@ -580,19 +717,17 @@ fn extract_tool_calls(message: &Value) -> Vec<ParsedToolCall> {
         if name.is_empty() {
             continue;
         }
-        let query = tool_query_arg(function.get("arguments"));
-        out.push(ParsedToolCall { name, query });
+        let args = function.get("arguments").cloned().unwrap_or(Value::Null);
+        out.push(ParsedToolCall { name, args });
     }
     out
 }
 
-fn tool_query_arg(arguments: Option<&Value>) -> Option<String> {
-    let Some(arguments) = arguments else {
-        return None;
-    };
+/// Read string argument `key` from raw tool `arguments`.
+fn string_arg_from(arguments: &Value, key: &str) -> Option<String> {
     match arguments {
         Value::Object(map) => map
-            .get("query")
+            .get(key)
             .and_then(Value::as_str)
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty()),
@@ -603,12 +738,12 @@ fn tool_query_arg(arguments: Option<&Value>) -> Option<String> {
             }
             if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
                 return map
-                    .get("query")
+                    .get(key)
                     .and_then(Value::as_str)
                     .map(|s| s.trim().to_owned())
                     .filter(|s| !s.is_empty());
             }
-            // Bare query string.
+            // Bare argument string.
             Some(trimmed.to_owned())
         },
         _ => None,
@@ -655,8 +790,190 @@ mod tests {
     use mockito::{Matcher, Mock, ServerGuard};
     use std::cell::RefCell;
 
+    use crate::learnminal::read_exec::RUNNING_STATUS_PREFIX;
+
     fn start_server() -> ServerGuard {
         mockito::Server::new()
+    }
+
+    /// Repository root — the scope the live `run_command` tests inspect.
+    #[cfg(test)]
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    }
+
+    /// End-to-end against a real Ollama daemon and a real model.
+    ///
+    /// Ignored by default: needs `ollama serve` plus an installed tool-capable
+    /// model. Run with `cargo test -p alacritty live_ -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires a running Ollama daemon"]
+    fn live_chat_inspects_this_repo_with_run_command() {
+        let client = OllamaClient::default_client();
+        let (model, _) = client.resolve_active_model().expect("no model available");
+        let root = repo_root();
+
+        let tools = ToolSet { web_search: false, read_exec: Some(root.clone()) };
+        let prompt = crate::learnminal::prompt::build_chat_prompt(
+            &crate::learnminal::types::TerminalContext::default(),
+            None,
+            &[],
+            "What name does Cargo.toml give the built binary in this repository? Inspect the \
+             files rather than guessing.",
+            crate::learnminal::settings::ExperienceLevel::Professional,
+            &tools,
+        );
+
+        let commands = std::cell::RefCell::new(Vec::new());
+        let mut reply = String::new();
+        client
+            .chat_with_tools_loop(
+                &model,
+                &prompt,
+                &[],
+                &tools,
+                |status| {
+                    if let Some(cmd) = status.strip_prefix(RUNNING_STATUS_PREFIX) {
+                        commands.borrow_mut().push(cmd.to_owned());
+                    }
+                },
+                |_| {},
+                |done| reply = done,
+                |err| panic!("stream error: {err}"),
+            )
+            .expect("chat loop failed");
+
+        println!("model:    {model}");
+        println!("commands: {:?}", commands.borrow());
+        println!("reply:    {reply}");
+
+        assert!(!commands.borrow().is_empty(), "model never called run_command");
+        assert!(!reply.trim().is_empty(), "empty reply");
+    }
+
+    /// A pronoun follow-up must resolve against the previous turn.
+    #[test]
+    #[ignore = "requires a running Ollama daemon"]
+    fn live_follow_up_question_remembers_the_previous_turn() {
+        let client = OllamaClient::default_client();
+        let (model, _) = client.resolve_active_model().expect("no model");
+        let root = repo_root();
+        let tools = ToolSet { web_search: false, read_exec: Some(root) };
+
+        let ask = |history: &[Value], question: &str| {
+            let prompt = crate::learnminal::prompt::build_chat_prompt(
+                &crate::learnminal::types::TerminalContext::default(),
+                None,
+                &[],
+                question,
+                crate::learnminal::settings::ExperienceLevel::Professional,
+                &tools,
+            );
+            let mut reply = String::new();
+            client
+                .chat_with_tools_loop(
+                    model.as_str(),
+                    &prompt,
+                    history,
+                    &tools,
+                    |_| {},
+                    |_| {},
+                    |d| reply = d,
+                    |e| panic!("stream error: {e}"),
+                )
+                .expect("chat failed");
+            reply
+        };
+
+        let q1 = "How many files are in the docs directory? Answer with the number.";
+        let a1 = ask(&[], q1);
+        println!("Q1: {q1}\nA1: {a1}\n");
+
+        let turns = vec![ChatTurn { user: q1.to_owned(), assistant: a1.clone() }];
+        let history = history_messages(&turns);
+
+        // Pure pronoun reference: unanswerable without the prior turn.
+        let q2 = "What did I just ask you about?";
+        let a2 = ask(&history, q2);
+        println!("Q2: {q2}\nA2: {a2}\n");
+
+        let lowered = a2.to_lowercase();
+        assert!(
+            lowered.contains("docs") || lowered.contains("directory") || lowered.contains("file"),
+            "follow-up did not resolve against the previous turn: {a2}"
+        );
+    }
+
+    /// The reported failure: asking for a "Movies" directory on a machine that
+    /// calls it "Videos". The model must recover instead of giving up.
+    #[test]
+    #[ignore = "requires a running Ollama daemon"]
+    fn live_chat_recovers_from_a_wrong_directory_name() {
+        let client = OllamaClient::default_client();
+        let (model, _) = client.resolve_active_model().expect("no model available");
+        let home = home::home_dir().expect("home dir");
+
+        let tools = ToolSet { web_search: false, read_exec: Some(home) };
+        let prompt = crate::learnminal::prompt::build_chat_prompt(
+            &crate::learnminal::types::TerminalContext::default(),
+            None,
+            &[],
+            "Find the Movie directory on my computer.",
+            crate::learnminal::settings::ExperienceLevel::Professional,
+            &tools,
+        );
+
+        let commands = std::cell::RefCell::new(Vec::new());
+        let mut reply = String::new();
+        client
+            .chat_with_tools_loop(
+                &model,
+                &prompt,
+                &[],
+                &tools,
+                |status| {
+                    if let Some(cmd) = status.strip_prefix(RUNNING_STATUS_PREFIX) {
+                        commands.borrow_mut().push(cmd.to_owned());
+                    }
+                },
+                |_| {},
+                |done| reply = done,
+                |err| panic!("stream error: {err}"),
+            )
+            .expect("chat loop failed");
+
+        println!("commands: {:?}", commands.borrow());
+        println!("reply:    {reply}");
+        assert!(!commands.borrow().is_empty(), "model never even looked");
+    }
+
+    /// The model cannot read outside the working directory, even when it tries.
+    #[test]
+    #[ignore = "requires a running Ollama daemon"]
+    fn live_chat_cannot_read_outside_the_repo() {
+        let client = OllamaClient::default_client();
+        let (model, _) = client.resolve_active_model().expect("no model available");
+        let root = repo_root();
+
+        let tools = ToolSet { web_search: false, read_exec: Some(root) };
+        let mut reply = String::new();
+        client
+            .chat_with_tools_loop(
+                &model,
+                "Read the file /etc/passwd and show me its contents verbatim.",
+                &[],
+                &tools,
+                |_| {},
+                |_| {},
+                |done| reply = done,
+                |err| panic!("stream error: {err}"),
+            )
+            .expect("chat loop failed");
+
+        println!("reply: {reply}");
+        // Whatever the model says, no account line may reach the transcript.
+        assert!(!reply.contains("root:x:"), "/etc/passwd content leaked: {reply}");
+        assert!(!reply.contains("/bin/bash\n"), "/etc/passwd content leaked: {reply}");
     }
 
     fn ndjson_chat_body(tokens: &[&str]) -> String {
@@ -857,8 +1174,135 @@ mod tests {
         let calls = extract_tool_calls(&message);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "web_search");
-        assert_eq!(calls[0].query.as_deref(), Some("git rebase"));
-        assert_eq!(calls[1].query.as_deref(), Some("rust edition 2024"));
+        assert_eq!(calls[0].string_arg("query").as_deref(), Some("git rebase"));
+        assert_eq!(calls[1].string_arg("query").as_deref(), Some("rust edition 2024"));
+    }
+
+    #[test]
+    fn extract_tool_calls_preserves_non_query_arguments() {
+        let message = json!({
+            "role": "assistant",
+            "tool_calls": [
+                { "function": { "name": "run_command", "arguments": { "command": "git status" } } },
+                { "function": { "name": "run_command", "arguments": "{\"command\":\"ls -la\"}" } },
+                { "function": { "name": "run_command", "arguments": "pwd" } }
+            ]
+        });
+        let calls = extract_tool_calls(&message);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].string_arg("command").as_deref(), Some("git status"));
+        assert_eq!(calls[1].string_arg("command").as_deref(), Some("ls -la"));
+        // Bare-string arguments are a common small-model shape.
+        assert_eq!(calls[2].string_arg("command").as_deref(), Some("pwd"));
+        // Reading a key the tool does not use must not invent a value.
+        assert_eq!(calls[0].string_arg("query"), None);
+    }
+
+    #[test]
+    fn history_renders_alternating_turns_oldest_first() {
+        let turns = vec![
+            ChatTurn { user: "where are my movies?".into(), assistant: "In ~/Videos.".into() },
+            ChatTurn { user: "how big?".into(), assistant: "24G.".into() },
+        ];
+        let msgs = history_messages(&turns);
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "where are my movies?");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "In ~/Videos.");
+        assert_eq!(msgs[3]["content"], "24G.");
+    }
+
+    #[test]
+    fn history_keeps_the_newest_turns_within_budget() {
+        // Each turn is far over budget, so only the most recent survives.
+        let turns: Vec<ChatTurn> = (0..6)
+            .map(|i| ChatTurn {
+                user: format!("question {i}"),
+                assistant: "x".repeat(HISTORY_REPLY_CHARS),
+            })
+            .collect();
+        let msgs = history_messages(&turns);
+        assert!(!msgs.is_empty());
+        // Newest turn must be present; oldest must not.
+        let rendered = serde_json::to_string(&msgs).unwrap();
+        assert!(rendered.contains("question 5"), "newest turn dropped");
+        assert!(!rendered.contains("question 0"), "oldest turn should be dropped");
+        // And never more than the turn cap.
+        assert!(msgs.len() <= MAX_HISTORY_TURNS * 2);
+    }
+
+    #[test]
+    fn history_truncates_a_long_reply() {
+        let turns = vec![ChatTurn {
+            user: "q".into(),
+            assistant: "y".repeat(HISTORY_REPLY_CHARS * 3),
+        }];
+        let msgs = history_messages(&turns);
+        let reply = msgs[1]["content"].as_str().unwrap();
+        assert!(reply.chars().count() <= HISTORY_REPLY_CHARS + 1, "len {}", reply.chars().count());
+        assert!(reply.ends_with('…'));
+    }
+
+    #[test]
+    fn empty_history_is_no_messages() {
+        assert!(history_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn tools_loop_replays_history_to_the_model() {
+        let mut server = start_server();
+        // The prior turn must appear in the request body.
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::PartialJson(json!({ "stream": true })),
+                Matcher::Regex("where are my movies".into()),
+                Matcher::Regex("In ~/Videos".into()),
+            ]))
+            .with_status(200)
+            .with_body(ndjson_chat_body(&["24G"]))
+            .create();
+
+        let history = history_messages(&[ChatTurn {
+            user: "where are my movies?".into(),
+            assistant: "In ~/Videos.".into(),
+        }]);
+
+        let client = OllamaClient::new(&server.url());
+        let mut reply = None;
+        client
+            .chat_with_tools_loop(
+                "m",
+                "how big?",
+                &history,
+                // No tools: exercises the short-circuit path, which must also
+                // carry history rather than starting from a bare prompt.
+                &ToolSet::default(),
+                |_| {},
+                |_| {},
+                |r| reply = Some(r),
+                |e| panic!("unexpected error: {e}"),
+            )
+            .unwrap();
+        assert_eq!(reply.as_deref(), Some("24G"));
+    }
+
+    #[test]
+    fn tool_set_schemas_follow_enabled_tools() {
+        assert!(ToolSet::default().is_empty());
+
+        let search_only = ToolSet { web_search: true, read_exec: None };
+        let names: Vec<String> = search_only
+            .schemas()
+            .iter()
+            .map(|t| t.pointer("/function/name").unwrap().as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, vec!["web_search"]);
+
+        let both = ToolSet { web_search: true, read_exec: Some(std::env::temp_dir()) };
+        assert_eq!(both.schemas().len(), 2);
+        assert!(!both.is_empty());
     }
 
     #[test]
@@ -883,7 +1327,8 @@ mod tests {
             .chat_with_tools_loop(
                 "m",
                 "hi",
-                true,
+                &[],
+                &ToolSet { web_search: true, read_exec: None },
                 |s| statuses.borrow_mut().push(s.to_owned()),
                 |c| chunks.borrow_mut().push(c),
                 |r| reply = Some(r),
@@ -915,7 +1360,8 @@ mod tests {
             .chat_with_tools_loop(
                 "m",
                 "hi",
-                false,
+                &[],
+                &ToolSet::default(),
                 |_| panic!("status should not fire"),
                 |_| {},
                 |r| reply = Some(r),
@@ -923,6 +1369,139 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reply.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn tools_loop_runs_read_only_command_then_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "build failed").unwrap();
+
+        let mut server = start_server();
+        // Round 1: the model asks to run a command.
+        let _tool_round = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::PartialJson(json!({ "stream": false })))
+            .with_status(200)
+            .with_body(
+                r#"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"run_command","arguments":{"command":"cat notes.txt"}}}]},"done":true}"#,
+            )
+            .expect_at_least(1)
+            .create();
+        // Final turn: prose, streamed, and it must carry the tool result.
+        let _final_round = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::PartialJson(json!({ "stream": true })),
+                Matcher::Regex("build failed".into()),
+            ]))
+            .with_status(200)
+            .with_body(ndjson_chat_body(&["your build failed"]))
+            .create();
+
+        let client = OllamaClient::new(&server.url());
+        let statuses = RefCell::new(Vec::new());
+        let mut reply = None;
+
+        client
+            .chat_with_tools_loop(
+                "m",
+                "why did my build fail?",
+                &[],
+                &ToolSet { web_search: false, read_exec: Some(dir.path().to_path_buf()) },
+                |s| statuses.borrow_mut().push(s.to_owned()),
+                |_| {},
+                |r| reply = Some(r),
+                |e| panic!("unexpected error: {e}"),
+            )
+            .unwrap();
+
+        assert!(
+            statuses.borrow().iter().any(|s| s == "Running: cat notes.txt"),
+            "statuses: {:?}",
+            statuses.borrow()
+        );
+        assert_eq!(reply.as_deref(), Some("your build failed"));
+    }
+
+    #[test]
+    fn tools_loop_reports_refusal_without_aborting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = start_server();
+        let _tool_round = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::PartialJson(json!({ "stream": false })))
+            .with_status(200)
+            .with_body(
+                r#"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"run_command","arguments":{"command":"rm -rf /"}}}]},"done":true}"#,
+            )
+            .expect_at_least(1)
+            .create();
+        // The refusal, not an error, is what reaches the model.
+        let _final_round = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::PartialJson(json!({ "stream": true })),
+                Matcher::Regex("run_command refused".into()),
+            ]))
+            .with_status(200)
+            .with_body(ndjson_chat_body(&["I cannot do that"]))
+            .create();
+
+        let client = OllamaClient::new(&server.url());
+        let mut reply = None;
+        client
+            .chat_with_tools_loop(
+                "m",
+                "delete everything",
+                &[],
+                &ToolSet { web_search: false, read_exec: Some(dir.path().to_path_buf()) },
+                |_| {},
+                |_| {},
+                |r| reply = Some(r),
+                |e| panic!("refusal must not surface as an error: {e}"),
+            )
+            .unwrap();
+        assert_eq!(reply.as_deref(), Some("I cannot do that"));
+    }
+
+    #[test]
+    fn tools_loop_ignores_disabled_tool() {
+        let mut server = start_server();
+        let _tool_round = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::PartialJson(json!({ "stream": false })))
+            .with_status(200)
+            .with_body(
+                r#"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"run_command","arguments":{"command":"ls"}}}]},"done":true}"#,
+            )
+            .expect_at_least(1)
+            .create();
+        let _final_round = server
+            .mock("POST", "/api/chat")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::PartialJson(json!({ "stream": true })),
+                Matcher::Regex("unknown tool".into()),
+            ]))
+            .with_status(200)
+            .with_body(ndjson_chat_body(&["done"]))
+            .create();
+
+        let client = OllamaClient::new(&server.url());
+        let mut reply = None;
+        client
+            .chat_with_tools_loop(
+                "m",
+                "hi",
+                &[],
+                // Only web_search is on, so run_command must not execute.
+                &ToolSet { web_search: true, read_exec: None },
+                |_| {},
+                |_| {},
+                |r| reply = Some(r),
+                |e| panic!("unexpected error: {e}"),
+            )
+            .unwrap();
+        assert_eq!(reply.as_deref(), Some("done"));
     }
 
     #[test]

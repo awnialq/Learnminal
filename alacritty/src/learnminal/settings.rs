@@ -15,6 +15,92 @@ pub const SETTINGS_DIR_NAME: &str = ".ai-cli-learning";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const MODEL_KEY: &str = "ollama_model";
 const EXPERIENCE_LEVEL_KEY: &str = "experience_level";
+const INSPECT_MODE_KEY: &str = "inspect_mode";
+
+/// How much the user wants to see of the assistant's read-only environment
+/// inspection (`run_command`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InspectMode {
+    /// The tool is not offered to the model at all.
+    Off,
+    /// The tool runs with no user-visible indication.
+    Quiet,
+    /// A transient status line names each command as it runs.
+    #[default]
+    Status,
+    /// Status line plus a permanent record in the chat transcript.
+    Verbose,
+}
+
+impl InspectMode {
+    /// All modes in display order.
+    pub const ALL: [Self; 4] = [Self::Off, Self::Quiet, Self::Status, Self::Verbose];
+
+    /// Canonical lowercase name used for persistence and slash commands.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Quiet => "quiet",
+            Self::Status => "status",
+            Self::Verbose => "verbose",
+        }
+    }
+
+    /// Human-readable title for overlay display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Quiet => "Quiet",
+            Self::Status => "Status",
+            Self::Verbose => "Verbose",
+        }
+    }
+
+    /// Short description of what this mode does.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Off => "the assistant cannot inspect your machine",
+            Self::Quiet => "inspect silently; no commands are shown",
+            Self::Status => "show each command in the status line while it runs",
+            Self::Verbose => "show each command and keep it in the transcript",
+        }
+    }
+
+    /// Whether the `run_command` tool is offered in this mode.
+    pub fn tool_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether the transient status line names the running command.
+    pub fn shows_status(self) -> bool {
+        matches!(self, Self::Status | Self::Verbose)
+    }
+
+    /// Whether executed commands are recorded in the chat transcript.
+    pub fn shows_transcript(self) -> bool {
+        matches!(self, Self::Verbose)
+    }
+}
+
+impl fmt::Display for InspectMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl FromStr for InspectMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "quiet" => Ok(Self::Quiet),
+            "status" | "on" => Ok(Self::Status),
+            "verbose" => Ok(Self::Verbose),
+            _ => Err(()),
+        }
+    }
+}
 
 /// User experience with the terminal and overall technical knowledge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -113,6 +199,33 @@ pub fn set_experience_level(level: ExperienceLevel) -> io::Result<()> {
     let dir = settings_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     write_experience_level(&dir, level)
+}
+
+/// Inspect-tool visibility from settings, defaulting to [`InspectMode::Status`].
+pub fn get_inspect_mode() -> InspectMode {
+    settings_path().and_then(|path| read_inspect_mode(&path)).unwrap_or_default()
+}
+
+/// Persist the inspect-tool visibility mode.
+pub fn set_inspect_mode(mode: InspectMode) -> io::Result<()> {
+    let dir = settings_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    write_inspect_mode(&dir, mode)
+}
+
+fn read_inspect_mode(path: &Path) -> Option<InspectMode> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let raw = value.get(INSPECT_MODE_KEY)?.as_str()?.trim();
+    if raw.is_empty() {
+        None
+    } else {
+        InspectMode::from_str(raw).ok()
+    }
+}
+
+fn write_inspect_mode(dir: &Path, mode: InspectMode) -> io::Result<()> {
+    write_setting(dir, INSPECT_MODE_KEY, Value::String(mode.as_str().to_owned()))
 }
 
 fn read_preferred_model(path: &Path) -> Option<String> {
@@ -235,6 +348,61 @@ mod tests {
         let path = dir.path().join(SETTINGS_FILE_NAME);
         std::fs::write(&path, r#"{"experience_level":"   "}"#).unwrap();
         assert!(read_experience_level(&path).is_none());
+    }
+
+    #[test]
+    fn round_trips_inspect_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        write_inspect_mode(dir.path(), InspectMode::Verbose).unwrap();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        assert_eq!(read_inspect_mode(&path), Some(InspectMode::Verbose));
+    }
+
+    #[test]
+    fn inspect_mode_defaults_to_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        assert!(read_inspect_mode(&path).is_none());
+        assert_eq!(InspectMode::default(), InspectMode::Status);
+    }
+
+    #[test]
+    fn invalid_inspect_mode_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, r#"{"inspect_mode":"loud"}"#).unwrap();
+        assert!(read_inspect_mode(&path).is_none());
+    }
+
+    #[test]
+    fn inspect_mode_capabilities_match_tiers() {
+        assert!(!InspectMode::Off.tool_enabled());
+        assert!(InspectMode::Quiet.tool_enabled());
+        assert!(!InspectMode::Quiet.shows_status());
+        assert!(InspectMode::Status.shows_status());
+        assert!(!InspectMode::Status.shows_transcript());
+        assert!(InspectMode::Verbose.shows_transcript());
+    }
+
+    #[test]
+    fn inspect_mode_parse_is_case_insensitive() {
+        assert_eq!("Off".parse(), Ok(InspectMode::Off));
+        assert_eq!("  VERBOSE ".parse(), Ok(InspectMode::Verbose));
+        assert_eq!("on".parse(), Ok(InspectMode::Status));
+        assert!("loud".parse::<InspectMode>().is_err());
+    }
+
+    #[test]
+    fn inspect_mode_write_preserves_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, r#"{"ollama_model":"m","experience_level":"expert"}"#).unwrap();
+
+        write_inspect_mode(dir.path(), InspectMode::Quiet).unwrap();
+
+        assert_eq!(read_preferred_model(&path).as_deref(), Some("m"));
+        assert_eq!(read_experience_level(&path), Some(ExperienceLevel::Expert));
+        assert_eq!(read_inspect_mode(&path), Some(InspectMode::Quiet));
     }
 
     #[test]

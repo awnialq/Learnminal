@@ -60,8 +60,10 @@ use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::learnminal::journal;
 use crate::learnminal::manpage::{reference_context, DEFAULT_CONTEXT_BUDGET};
+use crate::learnminal::ollama::ToolSet;
 use crate::learnminal::prompt::build_chat_prompt;
-use crate::learnminal::settings::{self, ExperienceLevel};
+use crate::learnminal::read_exec::{inspect_root, RUNNING_STATUS_PREFIX};
+use crate::learnminal::settings::{self, ExperienceLevel, InspectMode};
 use crate::learnminal::sysinfo;
 use crate::learnminal::types::resolve_program;
 use crate::learnminal::verify::{append_footer, verify_reply};
@@ -632,6 +634,11 @@ pub enum LearnminalEvent {
         generation: u64,
         info: SystemInfo,
     },
+    /// A read-only command the assistant ran (`InspectMode::Verbose` only).
+    ToolRan {
+        generation: u64,
+        command: String,
+    },
     /// Runnable commands extracted from a finished reply (top-right panel).
     ActionsReady {
         generation: u64,
@@ -1093,6 +1100,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 info!("Learnminal: /level slash command");
                 self.display.learnminal_overlay.begin_slash_command("/level");
                 self.run_learnminal_level(level, list);
+            },
+            SlashCommand::Inspect { mode, list } => {
+                info!("Learnminal: /inspect slash command");
+                self.display.learnminal_overlay.begin_slash_command("/inspect");
+                self.run_learnminal_inspect(mode, list);
             },
             // Handled entirely inside the overlay's key dispatch.
             SlashCommand::Help | SlashCommand::Clear | SlashCommand::Actions { .. } => {},
@@ -1864,39 +1876,90 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         }
     }
 
+    fn run_learnminal_inspect(&mut self, mode: Option<InspectMode>, list: bool) {
+        match mode {
+            Some(mode) if !list => match settings::set_inspect_mode(mode) {
+                Ok(()) => self.display.learnminal_overlay.show_inspect_mode_selected(mode),
+                Err(err) => self.display.learnminal_overlay.show_slash_message(
+                    "Environment inspection",
+                    &[format!("Could not save inspection mode: {err}")],
+                ),
+            },
+            _ => {
+                let current = settings::get_inspect_mode();
+                self.display.learnminal_overlay.show_inspect_modes(current);
+            },
+        }
+    }
+
     /// Returns the request generation the spawned chat reports its events under.
     fn spawn_learnminal_chat(&self, terminal_ctx: TerminalContext, message: String) -> u64 {
         let proxy = self.event_proxy.clone();
         let window_id = self.display.window.id();
         let generation = self.display.learnminal_overlay.bump_request_generation();
 
+        // Snapshot on the UI thread; the worker gets an owned copy.
+        let history = self.display.learnminal_overlay.history_messages();
+
         alacritty_terminal::thread::spawn_named("learnminal chat", move || {
             let program = resolve_program(&terminal_ctx.last_command, &message);
             let reference = reference_context(&program, DEFAULT_CONTEXT_BUDGET);
-            let journal_notes = if program.is_empty() {
-                Vec::new()
+            // Notes for a program-less question are stored under
+            // GENERAL_PROGRAM, so read them back from there rather than
+            // skipping the lookup and making them write-only.
+            // One key for both reading and writing. These used to disagree:
+            // a program-less question was stored under GENERAL_PROGRAM but the
+            // lookup was skipped, so those notes could never be read back.
+            let journal_key = if program.is_empty() {
+                journal::GENERAL_PROGRAM.to_owned()
             } else {
-                journal::recent_for_program_default(&program, 3)
+                program.clone()
             };
+            let journal_notes = journal::recent_for_program_default(&journal_key, 3);
             let experience_level = settings::get_experience_level();
+            let inspect_mode = settings::get_inspect_mode();
+            let tool_set = ToolSet {
+                web_search: crate::learnminal::web_search::web_search_enabled(),
+                read_exec: (crate::learnminal::read_exec::read_exec_enabled()
+                    && inspect_mode.tool_enabled())
+                .then(|| inspect_root(&terminal_ctx.cwd))
+                .flatten(),
+            };
             let prompt = build_chat_prompt(
                 &terminal_ctx,
                 Some(&reference),
                 &journal_notes,
                 &message,
                 experience_level,
+                &tool_set,
             );
             let client = OllamaClient::default_client();
             let last_command = terminal_ctx.last_command.clone();
-            let enable_web_search = crate::learnminal::web_search::web_search_enabled();
             let enable_actions = crate::learnminal::actions::actions_enabled();
             let result = client.resolve_active_model().and_then(|(model, _)| {
                 let actions_model = model.clone();
                 client.chat_with_tools_loop(
                     &model,
                     &prompt,
-                    enable_web_search,
+                    &history,
+                    &tool_set,
                     |status| {
+                        // Command statuses obey the user's /inspect mode; other
+                        // tool progress (web search) is always shown.
+                        if let Some(command) = status.strip_prefix(RUNNING_STATUS_PREFIX) {
+                            if inspect_mode.shows_transcript() {
+                                let _ = proxy.send_event(Event::new(
+                                    EventType::Learnminal(LearnminalEvent::ToolRan {
+                                        generation,
+                                        command: command.to_owned(),
+                                    }),
+                                    window_id,
+                                ));
+                            }
+                            if !inspect_mode.shows_status() {
+                                return;
+                            }
+                        }
                         let _ = proxy.send_event(Event::new(
                             EventType::Learnminal(LearnminalEvent::Status {
                                 generation,
@@ -1918,13 +1981,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                         let verify = verify_reply(&done, &reference);
                         let final_reply = append_footer(&done, &verify.footer);
                         if !final_reply.trim().is_empty() {
-                            let program_key = if program.is_empty() {
-                                journal::GENERAL_PROGRAM
-                            } else {
-                                program.as_str()
-                            };
                             let _ = journal::insert_note_default(
-                                program_key,
+                                &journal_key,
                                 &message,
                                 &final_reply,
                                 &last_command,
@@ -2432,6 +2490,16 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             self.ctx.cancel_learnminal_error_dismiss();
                             self.ctx.display.learnminal_overlay.set_status(&message);
                         },
+                        LearnminalEvent::ToolRan { generation, command }
+                            if !self
+                                .ctx
+                                .display
+                                .learnminal_overlay
+                                .is_stale_request(generation) =>
+                        {
+                            self.ctx.cancel_learnminal_error_dismiss();
+                            self.ctx.display.learnminal_overlay.append_tool_line(&command);
+                        },
                         LearnminalEvent::ChatDone { generation, reply }
                             if !self
                                 .ctx
@@ -2441,6 +2509,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         {
                             self.ctx.cancel_learnminal_error_dismiss();
                             self.ctx.display.learnminal_overlay.finalize_chat(&reply);
+                            self.ctx.display.learnminal_overlay.record_turn(&reply);
                         },
                         LearnminalEvent::ActionsReady { generation, actions }
                             if !self
@@ -2551,6 +2620,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         | LearnminalEvent::BackendNotRunning { .. }
                         | LearnminalEvent::Timeout { .. }
                         | LearnminalEvent::SystemInfo { .. }
+                        | LearnminalEvent::ToolRan { .. }
                         | LearnminalEvent::ActionsReady { .. } => {},
                     }
                     *self.ctx.dirty = true;

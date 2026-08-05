@@ -365,3 +365,4 @@ mod tests {
         assert!(!insert_note(&conn, "git", "q", "  ", "", "none", None));
     }
 }
+

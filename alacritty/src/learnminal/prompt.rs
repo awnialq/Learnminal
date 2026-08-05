@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use crate::learnminal::journal::JournalNote;
+use crate::learnminal::ollama::ToolSet;
 use crate::learnminal::settings::ExperienceLevel;
 use crate::learnminal::types::{ReferenceContext, TerminalContext};
 
@@ -20,9 +21,10 @@ pub fn build_chat_prompt(
     journal_notes: &[JournalNote],
     message: &str,
     experience_level: ExperienceLevel,
+    tools: &ToolSet,
 ) -> String {
     let mut prompt = String::new();
-    prompt.push_str(&system_instructions(experience_level));
+    prompt.push_str(&system_instructions(experience_level, tools));
     prompt.push_str("\n\n");
 
     if let Some(env) = env_line() {
@@ -74,17 +76,57 @@ pub fn build_chat_prompt(
     prompt
 }
 
-fn system_instructions(level: ExperienceLevel) -> String {
+/// Base instructions plus guidance for whichever tools are actually enabled.
+///
+/// A tool is only described when it is offered; advertising a disabled tool
+/// makes small models call it and then stall on the "unknown tool" reply.
+fn system_instructions(level: ExperienceLevel, tools: &ToolSet) -> String {
     let mut instructions = String::from(
         "You are an expert command-line educator helping a developer understand their shell.\n\
          Answer in clear conversational plain text. Do not use markdown.\n\
          Prefer the Reference and Past notes sections over remembered training data.\n\
          Do not invent flags or options that are not present in the Reference.\n\
-         If Reference is missing, say so rather than guessing flags.\n\
-         You may call the web_search tool for current events, version changes, changelogs,\n\
-         or facts not covered by Reference. Prefer local Reference for flags and options.\n\
-         When using search results, briefly cite titles or URLs in plain text.\n",
+         If Reference is missing, say so rather than guessing flags.\n",
     );
+    if tools.web_search {
+        instructions.push_str(
+            "You may call the web_search tool for current events, version changes, changelogs,\n\
+             or facts not covered by Reference. Prefer local Reference for flags and options.\n\
+             When using search results, briefly cite titles or URLs in plain text.\n",
+        );
+    }
+    if let Some(root) = tools.read_exec.as_deref() {
+        instructions.push_str(
+            "You may call the run_command tool to inspect this machine with read-only commands\n\
+             such as ls, cat, head, wc, stat, find, grep, which, env, uname, ps, df, and\n\
+             git status/log/diff. Use it whenever the answer depends on the user's actual files,\n\
+             directories, git state, or installed versions rather than on general knowledge.\n\
+             Investigate before you answer, and keep going until you have a real answer.\n\
+             One command is rarely enough: list a directory, then look inside the promising\n\
+             entries; if you do not know where something lives, search for it with find, and\n\
+             widen or loosen the search (case-insensitive, partial names, more depth) when the\n\
+             first attempt finds nothing. Related names count — a request for \"movies\" may be\n\
+             served by a directory called Videos, Media, or Film.\n\
+             You have ample tool calls available. Do not ration them, do not estimate when\n\
+             you could measure, and never cite limited steps as a reason to stop early — if a\n\
+             complete answer needs several more commands, run them. When asked which item is\n\
+             largest, newest, or most numerous, measure it (du, wc, stat, ls -l) rather than\n\
+             inferring from names.\n\
+             Run one command per call: pipes, redirects, and chaining are unavailable.\n\
+             A leading ~ is expanded to the home directory. find's grouping syntax works, so\n\
+             prefer one \\( -iname \"*.a\" -o -iname \"*.b\" \\) search over one call per pattern.\n\
+             A refused or failed command is information, not a dead end. Read the error text\n\
+             before deciding anything. \"No such file or directory\" usually means the name was\n\
+             wrong, not that the thing is missing: check the spelling, the capitalisation, and\n\
+             whether the user's word for it differs from the actual name. When the tool lists\n\
+             similarly named entries, treat them as the likely answer and look at them.\n\
+             Then try a different command that respects the error — do not repeat a refused\n\
+             command unchanged, and do not stop at the first failure. Only give up once you\n\
+             have genuinely run out of readable places to look; then say what you tried and\n\
+             what stopped you, rather than implying the thing does not exist.\n",
+        );
+        instructions.push_str(&format!("You can read files under {}.\n", root.display()));
+    }
     instructions.push_str(&experience_guidance(level));
     instructions
 }
@@ -189,6 +231,11 @@ mod tests {
     use super::*;
     use crate::learnminal::types::ReferenceSource;
 
+    /// The pre-existing default: web search on, environment inspection off.
+    fn search_only() -> ToolSet {
+        ToolSet { web_search: true, read_exec: None }
+    }
+
     fn ctx() -> TerminalContext {
         TerminalContext {
             last_command: "git push origin main".into(),
@@ -202,7 +249,14 @@ mod tests {
     #[test]
     fn prompt_includes_command_output_and_question() {
         let prompt =
-            build_chat_prompt(&ctx(), None, &[], "why did this fail?", ExperienceLevel::Beginner);
+            build_chat_prompt(
+            &ctx(),
+            None,
+            &[],
+            "why did this fail?",
+            ExperienceLevel::Beginner,
+            &search_only(),
+        );
         assert!(prompt.contains("Last command:\ngit push origin main"));
         assert!(prompt.contains("Exit code: 1"));
         assert!(prompt.contains("Output:\nerror: failed to push"));
@@ -219,7 +273,14 @@ mod tests {
             body: "NAME\n git - tracker".into(),
         };
         let prompt =
-            build_chat_prompt(&ctx(), Some(&reference), &[], "explain", ExperienceLevel::Novice);
+            build_chat_prompt(
+            &ctx(),
+            Some(&reference),
+            &[],
+            "explain",
+            ExperienceLevel::Novice,
+            &search_only(),
+        );
         assert!(prompt.contains("Reference (man):"));
         assert!(prompt.contains("git - tracker"));
     }
@@ -228,7 +289,14 @@ mod tests {
     fn prompt_includes_missing_reference_notice() {
         let reference = ReferenceContext::empty("obscuretool");
         let prompt =
-            build_chat_prompt(&ctx(), Some(&reference), &[], "help", ExperienceLevel::Beginner);
+            build_chat_prompt(
+            &ctx(),
+            Some(&reference),
+            &[],
+            "help",
+            ExperienceLevel::Beginner,
+            &search_only(),
+        );
         assert!(prompt.contains("No local man/--help"));
         assert!(prompt.contains("obscuretool"));
     }
@@ -246,7 +314,14 @@ mod tests {
             created_at: 1,
         }];
         let prompt =
-            build_chat_prompt(&ctx(), None, &notes, "again?", ExperienceLevel::Professional);
+            build_chat_prompt(
+            &ctx(),
+            None,
+            &notes,
+            "again?",
+            ExperienceLevel::Professional,
+            &search_only(),
+        );
         assert!(prompt.contains("Past notes for git:"));
         assert!(prompt.contains("how do I rebase?"));
         assert!(prompt.contains("Use git rebase -i"));
@@ -256,23 +331,57 @@ mod tests {
     fn prompt_omits_zero_exit_code() {
         let mut c = ctx();
         c.exit_code = Some(0);
-        let prompt = build_chat_prompt(&c, None, &[], "q", ExperienceLevel::Beginner);
+        let prompt = build_chat_prompt(&c, None, &[], "q", ExperienceLevel::Beginner, &search_only());
         assert!(!prompt.contains("Exit code:"));
     }
 
     #[test]
     fn prompt_includes_beginner_guidance() {
-        let prompt = build_chat_prompt(&ctx(), None, &[], "q", ExperienceLevel::Beginner);
+        let prompt = build_chat_prompt(&ctx(), None, &[], "q", ExperienceLevel::Beginner, &search_only());
         assert!(prompt.contains("User experience level: Beginner."));
         assert!(prompt.contains("step by step"));
     }
 
     #[test]
     fn prompt_includes_expert_guidance() {
-        let prompt = build_chat_prompt(&ctx(), None, &[], "q", ExperienceLevel::Expert);
+        let prompt = build_chat_prompt(&ctx(), None, &[], "q", ExperienceLevel::Expert, &search_only());
         assert!(prompt.contains("User experience level: Expert."));
         assert!(prompt.contains("terse and precise"));
         assert!(!prompt.contains("step by step"));
+    }
+
+    #[test]
+    fn tool_guidance_follows_enabled_tools() {
+        // Only enabled tools are described: a model told about a tool it was
+        // not given will call it and stall on the "unknown tool" reply.
+        let none = build_chat_prompt(
+            &ctx(),
+            None,
+            &[],
+            "q",
+            ExperienceLevel::Expert,
+            &ToolSet::default(),
+        );
+        assert!(!none.contains("web_search"));
+        assert!(!none.contains("run_command"));
+
+        let search =
+            build_chat_prompt(&ctx(), None, &[], "q", ExperienceLevel::Expert, &search_only());
+        assert!(search.contains("web_search"));
+        assert!(!search.contains("run_command"));
+
+        let both = build_chat_prompt(
+            &ctx(),
+            None,
+            &[],
+            "q",
+            ExperienceLevel::Expert,
+            &ToolSet { web_search: true, read_exec: Some(std::env::temp_dir()) },
+        );
+        assert!(both.contains("web_search"));
+        assert!(both.contains("run_command"));
+        assert!(both.contains("git status/log/diff"));
+        assert!(both.contains("refused"));
     }
 
     #[test]

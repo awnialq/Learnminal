@@ -4,7 +4,7 @@
 //! are missing. Used as hidden context for the chat model.
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::learnminal::docs_fallback;
@@ -151,14 +151,21 @@ fn fetch_help(program: &str) -> Option<String> {
 ///
 /// Returns `None` if the command fails to spawn or exceeds the timeout.
 pub(crate) fn run_with_timeout_public(cmd: &mut Command) -> Option<(Vec<u8>, Vec<u8>)> {
+    run_with_timeout_inner(cmd).map(|(_status, stdout, stderr)| (stdout, stderr))
+}
+
+/// Like [`run_with_timeout_public`], but also reports the child's exit status.
+pub(crate) fn run_with_timeout_status(
+    cmd: &mut Command,
+) -> Option<(ExitStatus, Vec<u8>, Vec<u8>)> {
     run_with_timeout_inner(cmd)
 }
 
 fn run_with_timeout(mut cmd: Command) -> Option<(Vec<u8>, Vec<u8>)> {
-    run_with_timeout_inner(&mut cmd)
+    run_with_timeout_inner(&mut cmd).map(|(_status, stdout, stderr)| (stdout, stderr))
 }
 
-fn run_with_timeout_inner(cmd: &mut Command) -> Option<(Vec<u8>, Vec<u8>)> {
+fn run_with_timeout_inner(cmd: &mut Command) -> Option<(ExitStatus, Vec<u8>, Vec<u8>)> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().ok()?;
 
@@ -183,10 +190,10 @@ fn run_with_timeout_inner(cmd: &mut Command) -> Option<(Vec<u8>, Vec<u8>)> {
     let deadline = Instant::now() + SUBPROCESS_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => {
+            Ok(Some(status)) => {
                 let stdout = out_handle.join().unwrap_or_default();
                 let stderr = err_handle.join().unwrap_or_default();
-                return Some((stdout, stderr));
+                return Some((status, stdout, stderr));
             },
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -204,7 +211,7 @@ fn run_with_timeout_inner(cmd: &mut Command) -> Option<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Strip ANSI SGR/erase sequences and overstrike backspaces (man formatting).
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     strip_backspaces(&strip_ansi(text))
 }
 
