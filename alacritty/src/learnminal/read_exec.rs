@@ -469,10 +469,11 @@ fn check_paths(tokens: &[String], root: &Path) -> Result<(), PolicyError> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     for token in &tokens[1..] {
-        if !is_path_candidate(token, &root) {
+        let candidate = path_portion(token);
+        if !is_path_candidate(candidate, &root) {
             continue;
         }
-        let raw = Path::new(token);
+        let raw = Path::new(candidate);
         let joined = if raw.is_absolute() { raw.to_path_buf() } else { root.join(raw) };
 
         // canonicalize resolves `..` and symlinks; comparing before it would
@@ -490,6 +491,23 @@ fn check_paths(tokens: &[String], root: &Path) -> Result<(), PolicyError> {
         }
     }
     Ok(())
+}
+
+/// The part of `token` that could name a file.
+///
+/// A flag can carry a path in its value — `du --files0-from=FILE`,
+/// `git --git-dir=DIR` — so the value is what gets scope-checked. Skipping
+/// every token that starts with `-` would let those read any file on the
+/// machine: `du` reports an unreadable name by printing it, so the contents of
+/// the named file come back in the error text, outside the root and past the
+/// secret-path rule alike.
+fn path_portion(token: &str) -> &str {
+    if !token.starts_with('-') {
+        return token;
+    }
+    // A flag with no attached value carries no path; its operand, if any, is a
+    // separate token and is checked on its own pass.
+    token.split_once('=').map_or("", |(_, value)| value)
 }
 
 /// [`similar_entries`], but only when the containing directory is itself
@@ -855,6 +873,60 @@ mod tests {
             refuse("cat ../outside.txt", &nested),
             PolicyError::PathOutsideScope("../outside.txt".into())
         );
+    }
+
+    #[test]
+    fn rejects_path_attached_to_a_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sub");
+        fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, "SECRET").unwrap();
+        let flag = format!("--files0-from={}", outside.display());
+
+        // `du` prints an unreadable name back at you, so letting this through
+        // would return the file's contents from outside the root.
+        assert_eq!(
+            refuse(&format!("du {flag}"), &root),
+            PolicyError::PathOutsideScope(flag.clone())
+        );
+        assert_eq!(refuse(&format!("wc {flag}"), &root), PolicyError::PathOutsideScope(flag));
+
+        // The secret rule applies to attached values too, inside the root.
+        let ssh = root.join(".ssh");
+        fs::create_dir(&ssh).unwrap();
+        fs::write(ssh.join("id_rsa"), "PRIVATE KEY").unwrap();
+        assert_eq!(
+            refuse("du --files0-from=.ssh/id_rsa", &root),
+            PolicyError::SecretPath("--files0-from=.ssh/id_rsa".into())
+        );
+
+        // Another repository's history is outside the scope as well.
+        assert_eq!(
+            refuse(&format!("git --git-dir={}/.git log", dir.path().display()), &root),
+            PolicyError::PathNotFound {
+                token: format!("--git-dir={}/.git", dir.path().display()),
+                similar: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn flag_values_that_are_not_paths_still_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "x").unwrap();
+        // Bare flags, and values that name no file, must not be mistaken for
+        // paths — refusing them would break ordinary inspection commands.
+        for command in
+            ["ls --color=never -la", "du --max-depth=2", "grep --include=*.rs pattern .", "ls -la"]
+        {
+            let tokens = tokenize(command).unwrap();
+            assert_eq!(
+                check_paths(&tokens, dir.path()),
+                Ok(()),
+                "{command} must not be refused as a path escape"
+            );
+        }
     }
 
     #[test]
